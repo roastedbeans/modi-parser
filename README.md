@@ -54,6 +54,40 @@ python3 qmdl_reader.py diag_log.qmdl -c output.csv
 - GSM protocols
 - GSMTAP encapsulation
 
+## Data Flow
+
+### QMDL ➜ PCAP, XML (PDML), and separate RRC/NAS CSV
+
+```mermaid
+graph TD
+  A["QMDL file (.qmdl)"] --> B["FileIO"]
+  B --> C["QualcommParser"]
+  C --> D["DataWriter.write_* ➜ PCAP"]
+  D --> E["PCAP file (.pcap)"]
+  E --> F["PyShark (tshark)"]
+  F --> G["PDML XML (.xml)"]
+  F --> H["Layer iteration & field categorization"]
+  H --> I["RRC CSV (<base>_rrc.csv)"]
+  H --> J["NAS CSV (<base>_nas.csv, headers lte./nr.)"]
+```
+
+Notes:
+
+- The `-c` flag is a base path; CSVs are written as `<base>_rrc.csv` and `<base>_nas.csv`.
+- NAS CSV headers normalize RAT prefixes: `lte_rrc.*`/`lte-rrc.*` ➜ `lte.*`, `nr_rrc.*`/`nr-rrc.*` ➜ `nr.*`.
+- When `-p` is supplied, the PCAP is written as a permanent output.
+
+### PCAP ➜ XML (PDML) and separate RRC/NAS CSV
+
+```mermaid
+graph TD
+  A["PCAP file (.pcap)"] --> B["PyShark (tshark) via DataWriter"]
+  B --> C["PDML XML (.xml)"]
+  B --> D["Layer iteration & field categorization"]
+  D --> E["RRC CSV (<base>_rrc.csv)"]
+  D --> F["NAS CSV (<base>_nas.csv, headers lte./nr.)"]
+```
+
 ## Usage Examples
 
 ### Export All Formats
