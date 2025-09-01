@@ -58,9 +58,11 @@ class DataWriter:
         # Initialize dissector field definitions
         self._load_dissector_fields()
         
-        # CSV export data
+        # CSV export data - separate for RRC and NAS
         self._rrc_packets_data = []
+        self._nas_packets_data = []
         self._all_rrc_fields = set()
+        self._all_nas_fields = set()
         self._packet_count = 0
 
     def _load_dissector_fields(self):
@@ -259,38 +261,50 @@ class DataWriter:
             pass
 
     def _extract_rrc_data_for_csv(self, packet, packet_num):
-        """Extract RRC data from packet for CSV export"""
+        """Extract RRC and NAS data from packet for CSV export"""
         try:
-            packet_data = {'packet_number': packet_num}
+            rrc_packet_data = {'packet_number': packet_num}
+            nas_packet_data = {'packet_number': packet_num}
             has_rrc_data = False
+            has_nas_data = False
             
-            # Look for RRC layers in the packet
+            # Look for RRC and NAS layers in the packet
             for layer in packet.layers:
                 try:
                     layer_name = layer.layer_name.lower()
                     
-                    # Skip non-RRC layers (IP, ETH, UDP, GSMTAP)
+                    # Skip non-RRC/NAS layers (IP, ETH, UDP, GSMTAP)
                     if layer_name in ['ip', 'eth', 'udp', 'gsmtap', 'frame', 'geninfo']:
                         continue
                     
-                    # Process RRC-related layers
-                    if any(rrc_type in layer_name for rrc_type in ['rrc', 'nas_eps', 'nas_5gs']):
-                        has_rrc_data = True
-                        self._extract_layer_fields_for_csv(layer, layer_name, packet_data)
+                    # Process RRC and NAS related layers
+                    if any(protocol_type in layer_name for protocol_type in ['rrc', 'nas_eps', 'nas_5gs', 'gsm_a']):
+                        self._extract_layer_fields_for_separate_csv(layer, layer_name, rrc_packet_data, nas_packet_data)
+                        
+                        # Check if we have data in either category
+                        if any(key != 'packet_number' for key in rrc_packet_data.keys()):
+                            has_rrc_data = True
+                        if any(key != 'packet_number' for key in nas_packet_data.keys()):
+                            has_nas_data = True
+                            
                 except Exception as e:
                     self.logger.debug(f"Error processing layer in packet {packet_num}: {e}")
                     continue
             
-            # Only add packet if it contains RRC data
+            # Add packets to appropriate data lists
             if has_rrc_data:
-                self._rrc_packets_data.append(packet_data)
+                self._rrc_packets_data.append(rrc_packet_data)
+            if has_nas_data:
+                self._nas_packets_data.append(nas_packet_data)
+                
+            if has_rrc_data or has_nas_data:
                 self._packet_count += 1
                 
         except Exception as e:
-            self.logger.debug(f"Error extracting RRC data for CSV: {e}")
+            self.logger.debug(f"Error extracting RRC/NAS data for CSV: {e}")
 
-    def _extract_layer_fields_for_csv(self, layer, layer_name, packet_data):
-        """Extract fields from a layer for CSV export"""
+    def _extract_layer_fields_for_separate_csv(self, layer, layer_name, rrc_packet_data, nas_packet_data):
+        """Extract fields from a layer and categorize them for separate RRC/NAS CSV export"""
         try:
             # Get protocol-specific field definitions
             protocol_fields = self._dissector_fields_cache.get(layer_name, {})
@@ -312,16 +326,79 @@ class DataWriter:
                             else:
                                 csv_field_name = f"{layer_name}.{field_name}"
                             
-                            # Add field to packet data and global field set
-                            packet_data[csv_field_name] = str(field_value)
-                            self._all_rrc_fields.add(csv_field_name)
+                            # Categorize the field
+                            field_category = self._categorize_field(csv_field_name, layer_name)
+                            
+                            # Add field to appropriate packet data and global field sets
+                            if field_category == 'rrc':
+                                rrc_packet_data[csv_field_name] = str(field_value)
+                                self._all_rrc_fields.add(csv_field_name)
+                            elif field_category == 'nas':
+                                norm_name = self._normalize_nas_csv_field_name(csv_field_name)
+                                nas_packet_data[norm_name] = str(field_value)
+                                self._all_nas_fields.add(norm_name)
+                            # Note: 'other' category fields are not included in CSV export
                             
                     except Exception as e:
                         self.logger.debug(f"Error processing field {field_name}: {e}")
                         continue
                         
         except Exception as e:
-            self.logger.debug(f"Error extracting layer fields for CSV: {e}")
+            self.logger.debug(f"Error extracting layer fields for separate CSV: {e}")
+
+    def _categorize_field(self, field_name, layer_name):
+        """
+        Categorize a field as RRC, NAS, or other based on layer name and field patterns
+        
+        Args:
+            field_name (str): The field name to categorize
+            layer_name (str): The protocol layer name
+            
+        Returns:
+            str: 'rrc', 'nas', or 'other'
+        """
+        try:
+            normalized_field_name = field_name.lower().replace('_', '-').replace('.', '-')
+            normalized_layer_name = layer_name.lower()
+            
+            # First priority: Field name pattern analysis (most reliable for embedded fields)
+            # Look for NAS-related patterns in field names - this catches embedded NAS fields in RRC layers
+            nas_patterns = ['nas-eps', 'nas-5gs', 'nas_eps', 'nas_5gs', 'emm', 'esm', 'gmm', 'sm-', 'mm-', 'gprs', 'gsm-a', 'attach', 'detach', 'tau', 'rai', 'tmsi', 'imsi', 'imei']
+            if any(pattern in normalized_field_name for pattern in nas_patterns):
+                return 'nas'
+            
+            # Second priority: Layer-based categorization
+            # NAS layers should always be categorized as NAS
+            if any(nas_type in normalized_layer_name for nas_type in ['nas', 'nas_eps', 'nas_5gs']):
+                return 'nas'
+            
+            # GSM A-interface layers should be categorized as NAS (they're part of NAS)
+            if any(gsm_type in normalized_layer_name for gsm_type in ['gsm_a', 'gsm_a_common', 'gsm_a_rr', 'gsm_a_gm', 'gsm_a_rp']):
+                return 'nas'
+            
+            # Look for RRC-related patterns in field names
+            rrc_patterns = ['lte-rrc', 'nr-rrc', 'rrc-', 'radio', 'resource', 'connection', 'setup', 'release', 'reconfiguration', 'measurement', 'handover', 'cell', 'paging', 'broadcast']
+            if any(pattern in normalized_field_name for pattern in rrc_patterns):
+                return 'rrc'
+            
+            # RRC layers should be categorized as RRC (after field pattern check)
+            if any(rrc_type in normalized_layer_name for rrc_type in ['rrc', 'lte_rrc', 'nr_rrc']):
+                return 'rrc'
+            
+            # Default to other for unknown fields
+            return 'other'
+            
+        except Exception as e:
+            self.logger.debug(f"Error categorizing field {field_name}: {e}")
+            return 'other'
+
+    def _normalize_nas_csv_field_name(self, field_name):
+        """Normalize NAS CSV header names by collapsing RAT RRC prefixes.
+        Examples: lte_rrc.foo -> lte.foo, lte-rrc.foo -> lte.foo, nr_rrc.foo -> nr.foo, nr-rrc.foo -> nr.foo"""
+        try:
+            return re.sub(r'^([a-z0-9]+)[-_]rrc\.', r'\1.', str(field_name).lower())
+        except Exception:
+            return field_name
 
     def _export_rrc_to_csv(self, csv_output_path):
         """Export RRC data to CSV file"""
@@ -354,10 +431,72 @@ class DataWriter:
         except Exception as e:
             self.logger.error(f"Error exporting RRC data to CSV: {e}")
 
+    def _export_nas_to_csv(self, csv_output_path):
+        """Export NAS data to CSV file"""
+        try:
+            if not self._nas_packets_data:
+                self.logger.warning("No NAS data to export to CSV")
+                return
+            
+            # Sort field names for consistent column ordering
+            sorted_fields = ['packet_number'] + sorted([self._normalize_nas_csv_field_name(f) for f in self._all_nas_fields])
+            
+            self.logger.info(f"Exporting {len(self._nas_packets_data)} NAS packets with {len(sorted_fields)} fields to CSV")
+            
+            with open(csv_output_path, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=sorted_fields, restval='-1')
+                
+                # Write header
+                writer.writeheader()
+                
+                # Write packet data
+                for packet_data in self._nas_packets_data:
+                    # Create row with -1 for missing fields
+                    row = {}
+                    for field in sorted_fields:
+                        row[field] = packet_data.get(field, '-1')
+                    writer.writerow(row)
+            
+            self.logger.info(f"Successfully exported NAS data to {csv_output_path}")
+            
+        except Exception as e:
+            self.logger.error(f"Error exporting NAS data to CSV: {e}")
+
+    def _export_separate_rrc_nas_csv(self, base_csv_path):
+        """
+        Export RRC and NAS data to separate CSV files
+        
+        Args:
+            base_csv_path (str): Base path for CSV files (without extension)
+        """
+        try:
+            # Generate separate file paths
+            rrc_csv_path = f"{base_csv_path}_rrc.csv"
+            nas_csv_path = f"{base_csv_path}_nas.csv"
+            
+            # Export RRC data
+            if self._rrc_packets_data:
+                self._export_rrc_to_csv(rrc_csv_path)
+                print(f"RRC CSV exported to: {rrc_csv_path}")
+            else:
+                print("No RRC data found for CSV export")
+            
+            # Export NAS data
+            if self._nas_packets_data:
+                self._export_nas_to_csv(nas_csv_path)
+                print(f"NAS CSV exported to: {nas_csv_path}")
+            else:
+                print("No NAS data found for CSV export")
+                
+        except Exception as e:
+            self.logger.error(f"Error exporting separate RRC/NAS CSV files: {e}")
+
     def _reset_csv_data(self):
         """Reset CSV data for new processing session"""
         self._rrc_packets_data = []
+        self._nas_packets_data = []
         self._all_rrc_fields = set()
+        self._all_nas_fields = set()
         self._packet_count = 0
 
     def _find_matching_field_definition(self, field_name, protocol_fields, protocol_name):
@@ -474,9 +613,9 @@ class DataWriter:
             # Convert PCAP to PDML XML using PyShark
             pdml_data = self._pcap_to_pdml_with_pyshark(pcap_file_path)
             
-            # Export RRC data to CSV if requested
-            if csv_output_path and self._rrc_packets_data:
-                self._export_rrc_to_csv(csv_output_path)
+            # Export RRC and NAS data to separate CSV files if requested
+            if csv_output_path and (self._rrc_packets_data or self._nas_packets_data):
+                self._export_separate_rrc_nas_csv(csv_output_path)
 
             return pdml_data
 
@@ -574,7 +713,7 @@ class DataWriter:
             pdml.set("capture_file", os.path.basename(pcap_file_path))
             
             packet_count = 0
-            max_packets = 1000  # Limit to prevent infinite processing
+            max_packets = 5000  # Limit to prevent infinite processing
             
             # Process each packet
             for packet in cap:

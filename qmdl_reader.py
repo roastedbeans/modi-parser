@@ -45,7 +45,7 @@ class QmdlReader:
             file_path (str): Path to the QMDL or PCAP file
             min_size_mb (int): Minimum file size in MB (default: 10MB) - only applies to QMDL files
             output_pdml (str): Optional PDML XML output file path
-            output_csv (str): Optional CSV output file path for RRC data
+            output_csv (str): Optional CSV output file base path for RRC/NAS data (will create _rrc.csv and _nas.csv)
             output_pcap (str): Optional permanent PCAP output file path
 
         Returns:
@@ -110,10 +110,19 @@ class QmdlReader:
             
             # Inform about CSV output
             if output_csv:
-                if os.path.exists(output_csv):
-                    print(f"RRC CSV output written to: {output_csv}")
+                # Check for separate RRC and NAS CSV files
+                rrc_csv_path = f"{output_csv}_rrc.csv"
+                nas_csv_path = f"{output_csv}_nas.csv"
+                
+                if os.path.exists(rrc_csv_path):
+                    print(f"RRC CSV output written to: {rrc_csv_path}")
                 else:
-                    print(f"No RRC data found for CSV export to: {output_csv}")
+                    print(f"No RRC data found for CSV export")
+                    
+                if os.path.exists(nas_csv_path):
+                    print(f"NAS CSV output written to: {nas_csv_path}")
+                else:
+                    print(f"No NAS data found for CSV export")
 
             # Inform about PCAP output
             if pcap_output_path:
@@ -232,7 +241,7 @@ class QmdlReader:
         Args:
             pcap_file_path (str): Path to the PCAP file
             output_pdml (str): Optional PDML XML output file path
-            output_csv (str): Optional CSV output file path for RRC data
+            output_csv (str): Optional CSV output file base path for RRC/NAS data
 
         Returns:
             str: PDML XML data from PyShark dissection
@@ -246,9 +255,9 @@ class QmdlReader:
             # Process PCAP directly with PyShark
             pdml_data = self.data_writer._pcap_to_pdml_with_pyshark(pcap_file_path)
             
-            # Export RRC data to CSV if requested
-            if output_csv and self.data_writer._rrc_packets_data:
-                self.data_writer._export_rrc_to_csv(output_csv)
+            # Export RRC and NAS data to separate CSV files if requested
+            if output_csv and (self.data_writer._rrc_packets_data or self.data_writer._nas_packets_data):
+                self.data_writer._export_separate_rrc_nas_csv(output_csv)
 
             # Write to output file if specified
             if output_pdml and not pdml_data.startswith('<pdml><e>'):
@@ -258,10 +267,19 @@ class QmdlReader:
             
             # Inform about CSV output
             if output_csv:
-                if os.path.exists(output_csv):
-                    print(f"RRC CSV output written to: {output_csv}")
+                # Check for separate RRC and NAS CSV files
+                rrc_csv_path = f"{output_csv}_rrc.csv"
+                nas_csv_path = f"{output_csv}_nas.csv"
+                
+                if os.path.exists(rrc_csv_path):
+                    print(f"RRC CSV output written to: {rrc_csv_path}")
                 else:
-                    print(f"No RRC data found for CSV export to: {output_csv}")
+                    print(f"No RRC data found for CSV export")
+                    
+                if os.path.exists(nas_csv_path):
+                    print(f"NAS CSV output written to: {nas_csv_path}")
+                else:
+                    print(f"No NAS data found for CSV export")
 
             return pdml_data
 
@@ -423,7 +441,7 @@ def process_qmdl_files_from_java(files_json):
 
 # PDML XML-specific convenience functions
 def read_qmdl_file_to_pdml(file_path, output_pdml=None, output_csv=None):
-    """Convenience function to read QMDL or PCAP file and convert to PDML XML with optional CSV export"""
+    """Convenience function to read QMDL or PCAP file and convert to PDML XML with optional RRC/NAS CSV export"""
     try:
         result = get_reader().read_qmdl_file_to_pdml(file_path, output_pdml=output_pdml, output_csv=output_csv)
         if result and not result.startswith('<pdml><e>'):
@@ -434,7 +452,7 @@ def read_qmdl_file_to_pdml(file_path, output_pdml=None, output_csv=None):
         return f'<pdml><e>{str(e)}</e></pdml>'
 
 def convert_qmdl_to_pdml(file_path, pdml_output_path=None, csv_output_path=None):
-    """Convenience function to convert QMDL or PCAP to PDML XML with optional CSV export"""
+    """Convenience function to convert QMDL or PCAP to PDML XML with optional RRC/NAS CSV export"""
     try:
         result = get_reader().read_qmdl_file_to_pdml(file_path, output_pdml=pdml_output_path, output_csv=csv_output_path)
         if result and not result.startswith('<pdml><e>'):
@@ -445,7 +463,7 @@ def convert_qmdl_to_pdml(file_path, pdml_output_path=None, csv_output_path=None)
         return f'<pdml><e>{str(e)}</e></pdml>'
 
 def convert_pcap_to_pdml(pcap_file_path, pdml_output_path=None, csv_output_path=None):
-    """Convenience function specifically for PCAP to PDML XML conversion with optional CSV export"""
+    """Convenience function specifically for PCAP to PDML XML conversion with optional RRC/NAS CSV export"""
     try:
         result = get_reader().read_qmdl_file_to_pdml(pcap_file_path, output_pdml=pdml_output_path, output_csv=csv_output_path)
         if result and not result.startswith('<pdml><e>'):
@@ -456,12 +474,12 @@ def convert_pcap_to_pdml(pcap_file_path, pdml_output_path=None, csv_output_path=
         return f'<pdml><e>{str(e)}</e></pdml>'
 
 if __name__ == "__main__":
-    # Command-line interface for QMDL/PCAP to PDML XML conversion with optional CSV export
+    # Command-line interface for QMDL/PCAP to PDML XML conversion with optional RRC/NAS CSV export
     import argparse
-    parser = argparse.ArgumentParser(description='QMDL/PCAP File Reader - PDML XML Output with RRC CSV Export')
+    parser = argparse.ArgumentParser(description='QMDL/PCAP File Reader - PDML XML Output with Separate RRC/NAS CSV Export')
     parser.add_argument('input_file', help='Input QMDL or PCAP file')
     parser.add_argument('-o', '--output', type=str, help='Output PDML XML file')
-    parser.add_argument('-c', '--csv', type=str, help='Output CSV file for RRC data')
+    parser.add_argument('-c', '--csv', type=str, help='Output CSV base path for RRC/NAS data (creates _rrc.csv and _nas.csv)')
     parser.add_argument('-p', '--pcap', type=str, help='Output PCAP file (permanent)')
     parser.add_argument('-s', '--size', type=int, default=10, help='Minimum file size in MB for QMDL files (default: 10)')
     args = parser.parse_args()
@@ -475,14 +493,18 @@ if __name__ == "__main__":
     if is_pcap:
         print(f"Converting PCAP file {input_file} to PDML XML...")
         if args.csv:
-            print(f"RRC data will be exported to CSV: {args.csv}")
+            print(f"RRC and NAS data will be exported to separate CSV files:")
+            print(f"  RRC: {args.csv}_rrc.csv")
+            print(f"  NAS: {args.csv}_nas.csv")
         if args.pcap:
             print(f"PCAP file will be exported to: {args.pcap}")
         result = reader.read_qmdl_file_to_pdml(input_file, output_pdml=args.output, output_csv=args.csv, output_pcap=args.pcap)
     else:
         print(f"Converting QMDL file {input_file} to PDML XML...")
         if args.csv:
-            print(f"RRC data will be exported to CSV: {args.csv}")
+            print(f"RRC and NAS data will be exported to separate CSV files:")
+            print(f"  RRC: {args.csv}_rrc.csv")
+            print(f"  NAS: {args.csv}_nas.csv")
         if args.pcap:
             print(f"PCAP file will be exported to: {args.pcap}")
         result = reader.read_qmdl_file_to_pdml(input_file, min_size_mb=args.size, output_pdml=args.output, output_csv=args.csv, output_pcap=args.pcap)
@@ -490,7 +512,7 @@ if __name__ == "__main__":
     if result and not result.startswith('<pdml><e>'):
         print("PDML XML conversion completed successfully!")
         if args.csv:
-            print("RRC CSV export completed!")
+            print("RRC and NAS CSV export completed!")
         if args.pcap:
             print("PCAP export completed!")
     else:

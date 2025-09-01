@@ -21,9 +21,11 @@ pip install pyshark bitstring pyusb pyserial packaging
 
 ```bash
 # Process QMDL file with all outputs (XML, CSV, PCAP)
+# Note: -c is a base path; this creates output.csv_rrc.csv and output.csv_nas.csv
 python3 qmdl_reader.py diag_log.qmdl -o output.xml -c output.csv -p output.pcap
 
 # Process PCAP file
+# Creates output.csv_rrc.csv and output.csv_nas.csv for RRC/NAS data
 python3 qmdl_reader.py capture.pcap -o output.xml -c output.csv
 
 # Auto-generate PCAP from CSV path (creates output.pcap from output.csv)
@@ -42,7 +44,7 @@ python3 qmdl_reader.py diag_log.qmdl -c output.csv
 ### ✅ Supported Formats
 
 - **Input**: QMDL files, PCAP files
-- **Output**: PDML XML, CSV (RRC data), PCAP files
+- **Output**: PDML XML, CSV (separate RRC/NAS), PCAP files
 
 ### ✅ Protocol Support
 
@@ -57,13 +59,14 @@ python3 qmdl_reader.py diag_log.qmdl -c output.csv
 ### Export All Formats
 
 ```bash
-python3 qmdl_reader.py diag_log.qmdl -o analysis.xml -c rrc_data.csv -p capture.pcap
+python3 qmdl_reader.py diag_log.qmdl -o analysis.xml -c signals.csv -p capture.pcap
+# Produces: signals.csv_rrc.csv and signals.csv_nas.csv
 ```
 
 ### Auto-Generate PCAP Path
 
 ```bash
-# Creates both output.csv and output.pcap
+# Creates output.csv_rrc.csv, output.csv_nas.csv and output.pcap
 python3 qmdl_reader.py diag_log.qmdl -c output.csv
 ```
 
@@ -92,7 +95,7 @@ options:
   -h, --help           show this help message and exit
   -o OUTPUT, --output OUTPUT
                        Output PDML XML file path
-  -c CSV, --csv CSV    Output CSV file path for RRC data
+  -c CSV, --csv CSV    Output CSV base path (creates <base>_rrc.csv and <base>_nas.csv)
   -p PCAP, --pcap PCAP Output PCAP file path (permanent)
   -s SIZE, --size SIZE  Minimum file size in MB for QMDL files (default: 10)
 ```
@@ -105,11 +108,15 @@ options:
 - Wireshark-compatible format
 - Detailed field analysis
 
-### CSV Output
+### CSV Output (RRC and NAS)
 
-- RRC-specific data in spreadsheet format
-- Packet numbers and timestamps
-- Cell identity, PLMN information, frequency parameters
+- Separate CSV exports: `<base>_rrc.csv` and `<base>_nas.csv`
+- RRC CSV: RRC-focused fields (LTE/NR)
+- NAS CSV: NAS and GSM A-interface fields
+- NAS CSV header normalization: RAT prefixes drop the RRC segment
+  - `lte_rrc.*` / `lte-rrc.*` become `lte.*`
+  - `nr_rrc.*` / `nr-rrc.*` become `nr.*`
+- Packet numbers and timestamps included
 
 ### PCAP Output
 
