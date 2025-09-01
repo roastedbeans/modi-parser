@@ -37,7 +37,7 @@ class QmdlReader:
         else:
             return str(obj)  # Convert any other type to string
 
-    def read_qmdl_file_to_pdml(self, file_path, min_size_mb=10, output_pdml=None, output_csv=None):
+    def read_qmdl_file_to_pdml(self, file_path, min_size_mb=10, output_pdml=None, output_csv=None, output_pcap=None):
         """
         Read a QMDL or PCAP file and export to PDML XML format using PyShark
 
@@ -46,6 +46,7 @@ class QmdlReader:
             min_size_mb (int): Minimum file size in MB (default: 10MB) - only applies to QMDL files
             output_pdml (str): Optional PDML XML output file path
             output_csv (str): Optional CSV output file path for RRC data
+            output_pcap (str): Optional permanent PCAP output file path
 
         Returns:
             str: PDML XML data from PyShark dissection, or None if file too small/not found
@@ -87,9 +88,17 @@ class QmdlReader:
             def packet_processor(data_writer):
                 return self._process_qmdl_with_data_writer(file_path, data_writer)
 
+            # Generate PCAP output path if not provided but CSV is requested
+            pcap_output_path = output_pcap
+            if not pcap_output_path and output_csv:
+                # Generate PCAP path based on CSV path
+                csv_path = Path(output_csv)
+                pcap_output_path = str(csv_path.with_suffix('.pcap'))
+                print(f"Auto-generating PCAP output path: {pcap_output_path}")
+
             pdml_data = self.data_writer.process_qmdl_to_pdml(
                 packet_processor,
-                temp_pcap_name=f"qmdl_{Path(file_path).stem}",
+                pcap_output_path=pcap_output_path,
                 csv_output_path=output_csv
             )
 
@@ -105,6 +114,13 @@ class QmdlReader:
                     print(f"RRC CSV output written to: {output_csv}")
                 else:
                     print(f"No RRC data found for CSV export to: {output_csv}")
+
+            # Inform about PCAP output
+            if pcap_output_path:
+                if os.path.exists(pcap_output_path):
+                    print(f"PCAP output written to: {pcap_output_path}")
+                else:
+                    print(f"PCAP file not created: {pcap_output_path}")
 
             return pdml_data
 
@@ -446,6 +462,7 @@ if __name__ == "__main__":
     parser.add_argument('input_file', help='Input QMDL or PCAP file')
     parser.add_argument('-o', '--output', type=str, help='Output PDML XML file')
     parser.add_argument('-c', '--csv', type=str, help='Output CSV file for RRC data')
+    parser.add_argument('-p', '--pcap', type=str, help='Output PCAP file (permanent)')
     parser.add_argument('-s', '--size', type=int, default=10, help='Minimum file size in MB for QMDL files (default: 10)')
     args = parser.parse_args()
 
@@ -459,17 +476,23 @@ if __name__ == "__main__":
         print(f"Converting PCAP file {input_file} to PDML XML...")
         if args.csv:
             print(f"RRC data will be exported to CSV: {args.csv}")
-        result = reader.read_qmdl_file_to_pdml(input_file, output_pdml=args.output, output_csv=args.csv)
+        if args.pcap:
+            print(f"PCAP file will be exported to: {args.pcap}")
+        result = reader.read_qmdl_file_to_pdml(input_file, output_pdml=args.output, output_csv=args.csv, output_pcap=args.pcap)
     else:
         print(f"Converting QMDL file {input_file} to PDML XML...")
         if args.csv:
             print(f"RRC data will be exported to CSV: {args.csv}")
-        result = reader.read_qmdl_file_to_pdml(input_file, min_size_mb=args.size, output_pdml=args.output, output_csv=args.csv)
+        if args.pcap:
+            print(f"PCAP file will be exported to: {args.pcap}")
+        result = reader.read_qmdl_file_to_pdml(input_file, min_size_mb=args.size, output_pdml=args.output, output_csv=args.csv, output_pcap=args.pcap)
 
     if result and not result.startswith('<pdml><e>'):
         print("PDML XML conversion completed successfully!")
         if args.csv:
             print("RRC CSV export completed!")
+        if args.pcap:
+            print("PCAP export completed!")
     else:
         error_msg = 'File processing failed' if not result else result
         print(f"PDML XML conversion failed: {error_msg}")

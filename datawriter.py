@@ -424,35 +424,45 @@ class DataWriter:
             self.logger.debug(f"Error in field matching for {field_name}: {e}")
             return None
 
-    def process_qmdl_to_pdml(self, packet_processor_func, temp_pcap_name=None, csv_output_path=None):
+    def process_qmdl_to_pdml(self, packet_processor_func, pcap_output_path=None, csv_output_path=None):
         """
-        Process QMDL packets and convert to PDML XML using temporary PCAP with PyShark
+        Process QMDL packets and convert to PDML XML using permanent PCAP with PyShark
 
         Args:
             packet_processor_func: Function that writes packets using this DataWriter
-            temp_pcap_name (str): Optional temporary PCAP file name prefix
+            pcap_output_path (str): Optional permanent PCAP output file path
             csv_output_path (str): Optional CSV output file path for RRC data
 
         Returns:
             str: PDML XML data from PyShark dissection
         """
-        temp_pcap = None
+        pcap_file_path = None
         try:
             # Reset CSV data for new processing session
             self._reset_csv_data()
             
-            # Create temporary PCAP file
-            temp_dir = tempfile.gettempdir()
-            temp_pcap = tempfile.NamedTemporaryFile(
-                delete=False,
-                suffix='.pcap',
-                prefix=temp_pcap_name or 'qmdl_temp_',
-                dir=temp_dir
-            )
-            temp_pcap.close()
+            # Create PCAP file path
+            if pcap_output_path:
+                # Use provided permanent path
+                pcap_file_path = pcap_output_path
+                # Ensure directory exists
+                pcap_dir = os.path.dirname(pcap_file_path)
+                if pcap_dir and not os.path.exists(pcap_dir):
+                    os.makedirs(pcap_dir)
+            else:
+                # Create temporary PCAP file as fallback
+                temp_dir = tempfile.gettempdir()
+                temp_pcap = tempfile.NamedTemporaryFile(
+                    delete=False,
+                    suffix='.pcap',
+                    prefix='qmdl_temp_',
+                    dir=temp_dir
+                )
+                pcap_file_path = temp_pcap.name
+                temp_pcap.close()
 
             # Initialize PCAP file
-            self._init_pcap_file(temp_pcap.name)
+            self._init_pcap_file(pcap_file_path)
 
             # Call packet processor function
             if packet_processor_func:
@@ -462,7 +472,7 @@ class DataWriter:
             self._close_pcap_file()
 
             # Convert PCAP to PDML XML using PyShark
-            pdml_data = self._pcap_to_pdml_with_pyshark(temp_pcap.name)
+            pdml_data = self._pcap_to_pdml_with_pyshark(pcap_file_path)
             
             # Export RRC data to CSV if requested
             if csv_output_path and self._rrc_packets_data:
@@ -476,12 +486,15 @@ class DataWriter:
             return f'<pdml><error>{error_msg}</error></pdml>'
 
         finally:
-            # Clean up temporary file
-            if temp_pcap and os.path.exists(temp_pcap.name):
+            # Only clean up if it's a temporary file (no pcap_output_path provided)
+            if not pcap_output_path and pcap_file_path and os.path.exists(pcap_file_path):
                 try:
-                    os.unlink(temp_pcap.name)
+                    os.unlink(pcap_file_path)
+                    self.logger.debug(f"Cleaned up temporary PCAP file: {pcap_file_path}")
                 except Exception as e:
-                    self.logger.warning(f"Failed to clean up temporary file {temp_pcap.name}: {e}")
+                    self.logger.warning(f"Failed to clean up temporary file {pcap_file_path}: {e}")
+            elif pcap_output_path and pcap_file_path:
+                self.logger.info(f"Permanent PCAP file saved: {pcap_file_path}")
 
     def _init_pcap_file(self, filename):
         """Initialize PCAP file with global header"""
