@@ -1,6 +1,6 @@
 """
 QMDL/PCAP File Reader - Direct PCAP Export Version
-Python module for reading QMDL and PCAP files and exporting to PDML XML format
+Python module for reading QMDL and PCAP files and exporting to CSV format
 Based on scat project FileIO approach
 """
 
@@ -15,7 +15,7 @@ from datawriter import DataWriter
 
 
 class QmdlReader:
-    """Class for reading QMDL and PCAP files and exporting to PDML XML format"""
+    """Class for reading QMDL and PCAP files and exporting to CSV format"""
 
     def __init__(self):
         self.data_writer = DataWriter()
@@ -37,25 +37,24 @@ class QmdlReader:
         else:
             return str(obj)  # Convert any other type to string
 
-    def read_qmdl_file_to_pdml(self, file_path, min_size_mb=10, output_pdml=None, output_csv=None, output_pcap=None):
+    def read_qmdl_file_to_csv(self, file_path, min_size_mb=10, output_csv=None, output_pcap=None):
         """
-        Read a QMDL or PCAP file and export to PDML XML format using PyShark
+        Read a QMDL or PCAP file and export to CSV format using PyShark
 
         Args:
             file_path (str): Path to the QMDL or PCAP file
             min_size_mb (int): Minimum file size in MB (default: 10MB) - only applies to QMDL files
-            output_pdml (str): Optional PDML XML output file path
-            output_csv (str): Optional CSV output file base path for RRC/NAS data (will create _rrc.csv and _nas.csv)
+            output_csv (str): Optional CSV output file path for RRC data
             output_pcap (str): Optional permanent PCAP output file path
 
         Returns:
-            str: PDML XML data from PyShark dissection, or None if file too small/not found
+            bool: Success status
         """
         # Determine file type and check if it exists
         try:
             if not os.path.exists(file_path):
                 print(f"File not found: {file_path}")
-                return None
+                return False
                 
             file_size = os.path.getsize(file_path)
             file_size_mb = file_size / (1024*1024)
@@ -65,26 +64,26 @@ class QmdlReader:
             
             if is_pcap:
                 print(f"Reading PCAP file: {file_path} ({file_size_mb:.1f}MB)")
-                return self._process_pcap_file(file_path, output_pdml, output_csv)
+                return self._process_pcap_file(file_path, output_csv, output_pcap)
             else:
                 # QMDL file - check size
                 min_size_bytes = min_size_mb * 1024 * 1024
                 if file_size < min_size_bytes:
                     print(f"QMDL file too small: {file_path} ({file_size_mb:.1f}MB < {min_size_mb}MB)")
-                    return None
+                    return False
                 print(f"Reading QMDL file: {file_path} ({file_size_mb:.1f}MB)")
 
         except Exception as e:
             print(f"Error accessing file {file_path}: {e}")
-            return None
+            return False
 
         # Check if PyShark is available
         if not self.data_writer.is_pyshark_available():
-            print("Warning: PyShark not available, falling back to direct PDML conversion")
-            return self._read_qmdl_with_direct_pdml_conversion(file_path, output_pdml)
+            print("Warning: PyShark not available, CSV export may not work properly")
+            return False
 
         try:
-            # Use DataWriter's process_qmdl_to_pdml method
+            # Use DataWriter's CSV export functionality
             def packet_processor(data_writer):
                 return self._process_qmdl_with_data_writer(file_path, data_writer)
 
@@ -96,34 +95,13 @@ class QmdlReader:
                 pcap_output_path = str(csv_path.with_suffix('.pcap'))
                 print(f"Auto-generating PCAP output path: {pcap_output_path}")
 
-            pdml_data = self.data_writer.process_qmdl_to_pdml(
-                packet_processor,
-                pcap_output_path=pcap_output_path,
-                csv_output_path=output_csv
-            )
-
-            # Write to output file if specified
-            if output_pdml and not pdml_data.startswith('<pdml><e>'):
-                with open(output_pdml, 'w', encoding='utf-8') as f:
-                    f.write(pdml_data)
-                print(f"PDML XML output written to: {output_pdml}")
+            # Process QMDL and create PCAP
+            success = self._process_qmdl_to_pcap(packet_processor, pcap_output_path)
             
-            # Inform about CSV output
-            if output_csv:
-                # Check for separate RRC and NAS CSV files
-                rrc_csv_path = f"{output_csv}_rrc.csv"
-                nas_csv_path = f"{output_csv}_nas.csv"
-                
-                if os.path.exists(rrc_csv_path):
-                    print(f"RRC CSV output written to: {rrc_csv_path}")
-                else:
-                    print(f"No RRC data found for CSV export")
-                    
-                if os.path.exists(nas_csv_path):
-                    print(f"NAS CSV output written to: {nas_csv_path}")
-                else:
-                    print(f"No NAS data found for CSV export")
-
+            if success and output_csv and self.data_writer._rrc_packets_data:
+                self.data_writer._export_rrc_to_csv(output_csv)
+                print(f"RRC CSV output written to: {output_csv}")
+            
             # Inform about PCAP output
             if pcap_output_path:
                 if os.path.exists(pcap_output_path):
@@ -131,13 +109,78 @@ class QmdlReader:
                 else:
                     print(f"PCAP file not created: {pcap_output_path}")
 
-            return pdml_data
+            return success
 
         except Exception as e:
-            print(f"Error in PDML conversion: {e}")
+            print(f"Error in CSV conversion: {e}")
             import traceback
             traceback.print_exc()
-            return None
+            return False
+
+    def _process_qmdl_to_pcap(self, packet_processor_func, pcap_output_path=None):
+        """
+        Process QMDL packets and create PCAP file
+
+        Args:
+            packet_processor_func: Function that writes packets using this DataWriter
+            pcap_output_path (str): Optional permanent PCAP output file path
+
+        Returns:
+            bool: Success status
+        """
+        pcap_file_path = None
+        try:
+            # Reset CSV data for new processing session
+            self.data_writer._reset_csv_data()
+            
+            # Create PCAP file path
+            if pcap_output_path:
+                # Use provided permanent path
+                pcap_file_path = pcap_output_path
+                # Ensure directory exists
+                pcap_dir = os.path.dirname(pcap_file_path)
+                if pcap_dir and not os.path.exists(pcap_dir):
+                    os.makedirs(pcap_dir)
+            else:
+                # Create temporary PCAP file as fallback
+                import tempfile
+                temp_dir = tempfile.gettempdir()
+                temp_pcap = tempfile.NamedTemporaryFile(
+                    delete=False,
+                    suffix='.pcap',
+                    prefix='qmdl_temp_',
+                    dir=temp_dir
+                )
+                pcap_file_path = temp_pcap.name
+                temp_pcap.close()
+
+            # Initialize PCAP file
+            self.data_writer._init_pcap_file(pcap_file_path)
+
+            # Call packet processor function
+            if packet_processor_func:
+                packet_processor_func(self.data_writer)
+
+            # Close PCAP file
+            self.data_writer._close_pcap_file()
+
+            return True
+
+        except Exception as e:
+            error_msg = f"Error processing QMDL to PCAP: {e}"
+            print(error_msg)
+            return False
+
+        finally:
+            # Only clean up if it's a temporary file (no pcap_output_path provided)
+            if not pcap_output_path and pcap_file_path and os.path.exists(pcap_file_path):
+                try:
+                    os.unlink(pcap_file_path)
+                    print(f"Cleaned up temporary PCAP file: {pcap_file_path}")
+                except Exception as e:
+                    print(f"Failed to clean up temporary file {pcap_file_path}: {e}")
+            elif pcap_output_path and pcap_file_path:
+                print(f"Permanent PCAP file saved: {pcap_file_path}")
 
     def _process_qmdl_with_data_writer(self, qmdl_file_path, data_writer):
         """
@@ -200,107 +243,80 @@ class QmdlReader:
             traceback.print_exc()
             return False
 
-    def _read_qmdl_with_direct_pdml_conversion(self, file_path, output_pdml=None):
-        """
-        Fallback method to read QMDL and convert to PDML XML without PyShark
-
-        Args:
-            file_path (str): Path to the QMDL file
-            output_pdml (str): Optional PDML XML output file path
-
-        Returns:
-            str: PDML XML data
-        """
-        try:
-            # This would need to be implemented based on your specific packet parsing needs
-            # For now, return a basic PDML structure
-            pdml_data = f'''<?xml version="1.0" encoding="utf-8"?>
-<pdml>
-    <packet>
-        <proto name="fake">
-            <field name="info" show="QMDL packet data" />
-            <field name="source" show="{file_path}" />
-            <field name="note" show="PyShark not available - using fallback method" />
-        </proto>
-    </packet>
-</pdml>'''
-
-            if output_pdml:
-                with open(output_pdml, 'w', encoding='utf-8') as f:
-                    f.write(pdml_data)
-
-            return pdml_data
-
-        except Exception as e:
-            return f'<pdml><e>Fallback PDML conversion failed: {e}</e></pdml>'
-
-    def _process_pcap_file(self, pcap_file_path, output_pdml=None, output_csv=None):
+    def _process_pcap_file(self, pcap_file_path, output_csv=None, output_pcap=None):
         """
         Process PCAP file directly using PyShark
 
         Args:
             pcap_file_path (str): Path to the PCAP file
-            output_pdml (str): Optional PDML XML output file path
-            output_csv (str): Optional CSV output file base path for RRC/NAS data
+            output_csv (str): Optional CSV output file path for RRC data
+            output_pcap (str): Optional permanent PCAP output file path
 
         Returns:
-            str: PDML XML data from PyShark dissection
+            bool: Success status
         """
         try:
             # Check if PyShark is available
             if not self.data_writer.is_pyshark_available():
                 print("Warning: PyShark not available for PCAP processing")
-                return f'<pdml><e>PyShark not available - install with: pip install pyshark</e></pdml>'
+                return False
 
-            # Process PCAP directly with PyShark
-            pdml_data = self.data_writer._pcap_to_pdml_with_pyshark(pcap_file_path)
-            
-            # Export RRC and NAS data to separate CSV files if requested
-            if output_csv and (self.data_writer._rrc_packets_data or self.data_writer._nas_packets_data):
-                self.data_writer._export_separate_rrc_nas_csv(output_csv)
-
-            # Write to output file if specified
-            if output_pdml and not pdml_data.startswith('<pdml><e>'):
-                with open(output_pdml, 'w', encoding='utf-8') as f:
-                    f.write(pdml_data)
-                print(f"PDML XML output written to: {output_pdml}")
-            
-            # Inform about CSV output
+            # Process PCAP directly with PyShark for CSV export
             if output_csv:
-                # Check for separate RRC and NAS CSV files
-                rrc_csv_path = f"{output_csv}_rrc.csv"
-                nas_csv_path = f"{output_csv}_nas.csv"
+                # Use PyShark to extract RRC data for CSV
+                import pyshark
+                cap = pyshark.FileCapture(pcap_file_path, include_raw=False, use_json=False)
                 
-                if os.path.exists(rrc_csv_path):
-                    print(f"RRC CSV output written to: {rrc_csv_path}")
-                else:
-                    print(f"No RRC data found for CSV export")
+                packet_count = 0
+                max_packets = 10000  # Limit to prevent infinite processing
+                
+                # Process each packet to extract RRC data
+                for packet in cap:
+                    packet_count += 1
                     
-                if os.path.exists(nas_csv_path):
-                    print(f"NAS CSV output written to: {nas_csv_path}")
+                    # Limit packet processing to prevent hanging
+                    if packet_count > max_packets:
+                        print(f"Reached packet limit ({max_packets}), stopping processing")
+                        break
+                    
+                    # Extract RRC data for CSV export
+                    self.data_writer._extract_rrc_data_for_csv(packet, packet_count)
+                
+                cap.close()
+                
+                # Export RRC data to CSV if requested
+                if self.data_writer._rrc_packets_data:
+                    self.data_writer._export_rrc_to_csv(output_csv)
+                    print(f"RRC CSV output written to: {output_csv}")
                 else:
-                    print(f"No NAS data found for CSV export")
+                    print(f"No RRC data found for CSV export to: {output_csv}")
+            
+            # Copy PCAP if requested
+            if output_pcap and output_pcap != pcap_file_path:
+                import shutil
+                shutil.copy2(pcap_file_path, output_pcap)
+                print(f"PCAP file copied to: {output_pcap}")
 
-            return pdml_data
+            return True
 
         except Exception as e:
             error_msg = f"Error processing PCAP file: {e}"
             print(error_msg)
             import traceback
             traceback.print_exc()
-            return f'<pdml><e>{error_msg}</e></pdml>'
+            return False
 
-    def read_qmdl_file(self, file_path, min_size_mb=10, output_pdml=None):
+    def read_qmdl_file(self, file_path, min_size_mb=10, output_csv=None):
         """
-        Read a QMDL file and export to PDML XML format
+        Read a QMDL file and export to CSV format
 
         Args:
             file_path (str): Path to the QMDL file
             min_size_mb (int): Minimum file size in MB (default: 10MB)
-            output_pdml (str): Optional PDML XML output file path
+            output_csv (str): Optional CSV output file path
 
         Returns:
-            str: Processing results and metadata in PDML XML, or None if file too small
+            bool: Success status, or None if file too small
         """
         # Check file size first
         try:
@@ -317,8 +333,8 @@ class QmdlReader:
             print(f"Error accessing file {file_path}: {e}")
             return None
 
-        # Use the PDML conversion method
-        return self.read_qmdl_file_to_pdml(file_path, min_size_mb, output_pdml)
+        # Use the CSV conversion method
+        return self.read_qmdl_file_to_csv(file_path, min_size_mb, output_csv)
     
 
     
@@ -385,7 +401,7 @@ class QmdlReader:
         """Read a QMDL file and return JSON serialized result"""
         try:
             result = self.read_qmdl_file(file_path)
-            if result:
+            if result is not None:
                 # Convert datetime objects and bytes to strings for JSON serialization
                 result_serializable = self._convert_datetime_to_string(result)
                 return json.dumps(result_serializable)
@@ -433,53 +449,44 @@ def read_qmdl_file(file_path):
     """Convenience function for Java to read QMDL file"""
     return get_reader().read_qmdl_file_json(file_path)
 
-
-
 def process_qmdl_files_from_java(files_json):
     """Convenience function for Java to process QMDL files list"""
     return get_reader().process_qmdl_files_from_java_json(files_json)
 
-# PDML XML-specific convenience functions
-def read_qmdl_file_to_pdml(file_path, output_pdml=None, output_csv=None):
-    """Convenience function to read QMDL or PCAP file and convert to PDML XML with optional RRC/NAS CSV export"""
+# CSV export convenience functions
+def read_qmdl_file_to_csv(file_path, output_csv=None, output_pcap=None):
+    """Convenience function to read QMDL or PCAP file and convert to CSV with optional PCAP export"""
     try:
-        result = get_reader().read_qmdl_file_to_pdml(file_path, output_pdml=output_pdml, output_csv=output_csv)
-        if result and not result.startswith('<pdml><e>'):
-            return result
-        else:
-            return f'<pdml><e>Failed to process file to PDML XML</e></pdml>'
+        result = get_reader().read_qmdl_file_to_csv(file_path, output_csv=output_csv, output_pcap=output_pcap)
+        return result
     except Exception as e:
-        return f'<pdml><e>{str(e)}</e></pdml>'
+        print(f"Error: {str(e)}")
+        return False
 
-def convert_qmdl_to_pdml(file_path, pdml_output_path=None, csv_output_path=None):
-    """Convenience function to convert QMDL or PCAP to PDML XML with optional RRC/NAS CSV export"""
+def convert_qmdl_to_csv(file_path, csv_output_path=None, pcap_output_path=None):
+    """Convenience function to convert QMDL or PCAP to CSV with optional PCAP export"""
     try:
-        result = get_reader().read_qmdl_file_to_pdml(file_path, output_pdml=pdml_output_path, output_csv=csv_output_path)
-        if result and not result.startswith('<pdml><e>'):
-            return result
-        else:
-            return f'<pdml><e>Failed to convert file to PDML XML</e></pdml>'
+        result = get_reader().read_qmdl_file_to_csv(file_path, output_csv=csv_output_path, output_pcap=pcap_output_path)
+        return result
     except Exception as e:
-        return f'<pdml><e>{str(e)}</e></pdml>'
+        print(f"Error: {str(e)}")
+        return False
 
-def convert_pcap_to_pdml(pcap_file_path, pdml_output_path=None, csv_output_path=None):
-    """Convenience function specifically for PCAP to PDML XML conversion with optional RRC/NAS CSV export"""
+def convert_pcap_to_csv(pcap_file_path, csv_output_path=None, pcap_output_path=None):
+    """Convenience function specifically for PCAP to CSV conversion with optional PCAP export"""
     try:
-        result = get_reader().read_qmdl_file_to_pdml(pcap_file_path, output_pdml=pdml_output_path, output_csv=csv_output_path)
-        if result and not result.startswith('<pdml><e>'):
-            return result
-        else:
-            return f'<pdml><e>Failed to convert PCAP to PDML XML</e></pdml>'
+        result = get_reader().read_qmdl_file_to_csv(pcap_file_path, output_csv=csv_output_path, output_pcap=pcap_output_path)
+        return result
     except Exception as e:
-        return f'<pdml><e>{str(e)}</e></pdml>'
+        print(f"Error: {str(e)}")
+        return False
 
 if __name__ == "__main__":
-    # Command-line interface for QMDL/PCAP to PDML XML conversion with optional RRC/NAS CSV export
+    # Command-line interface for QMDL/PCAP to CSV conversion with optional PCAP export
     import argparse
-    parser = argparse.ArgumentParser(description='QMDL/PCAP File Reader - PDML XML Output with Separate RRC/NAS CSV Export')
+    parser = argparse.ArgumentParser(description='QMDL/PCAP File Reader - CSV Output with RRC Data Export')
     parser.add_argument('input_file', help='Input QMDL or PCAP file')
-    parser.add_argument('-o', '--output', type=str, help='Output PDML XML file')
-    parser.add_argument('-c', '--csv', type=str, help='Output CSV base path for RRC/NAS data (creates _rrc.csv and _nas.csv)')
+    parser.add_argument('-c', '--csv', type=str, help='Output CSV file for RRC data')
     parser.add_argument('-p', '--pcap', type=str, help='Output PCAP file (permanent)')
     parser.add_argument('-s', '--size', type=int, default=10, help='Minimum file size in MB for QMDL files (default: 10)')
     args = parser.parse_args()
@@ -491,30 +498,25 @@ if __name__ == "__main__":
     is_pcap = input_file.lower().endswith(('.pcap', '.pcapng'))
     
     if is_pcap:
-        print(f"Converting PCAP file {input_file} to PDML XML...")
+        print(f"Converting PCAP file {input_file} to CSV...")
         if args.csv:
-            print(f"RRC and NAS data will be exported to separate CSV files:")
-            print(f"  RRC: {args.csv}_rrc.csv")
-            print(f"  NAS: {args.csv}_nas.csv")
+            print(f"RRC data will be exported to CSV: {args.csv}")
         if args.pcap:
             print(f"PCAP file will be exported to: {args.pcap}")
-        result = reader.read_qmdl_file_to_pdml(input_file, output_pdml=args.output, output_csv=args.csv, output_pcap=args.pcap)
+        result = reader.read_qmdl_file_to_csv(input_file, output_csv=args.csv, output_pcap=args.pcap)
     else:
-        print(f"Converting QMDL file {input_file} to PDML XML...")
+        print(f"Converting QMDL file {input_file} to CSV...")
         if args.csv:
-            print(f"RRC and NAS data will be exported to separate CSV files:")
-            print(f"  RRC: {args.csv}_rrc.csv")
-            print(f"  NAS: {args.csv}_nas.csv")
+            print(f"RRC data will be exported to CSV: {args.csv}")
         if args.pcap:
             print(f"PCAP file will be exported to: {args.pcap}")
-        result = reader.read_qmdl_file_to_pdml(input_file, min_size_mb=args.size, output_pdml=args.output, output_csv=args.csv, output_pcap=args.pcap)
+        result = reader.read_qmdl_file_to_csv(input_file, min_size_mb=args.size, output_csv=args.csv, output_pcap=args.pcap)
 
-    if result and not result.startswith('<pdml><e>'):
-        print("PDML XML conversion completed successfully!")
+    if result:
+        print("CSV conversion completed successfully!")
         if args.csv:
-            print("RRC and NAS CSV export completed!")
+            print("RRC CSV export completed!")
         if args.pcap:
             print("PCAP export completed!")
     else:
-        error_msg = 'File processing failed' if not result else result
-        print(f"PDML XML conversion failed: {error_msg}")
+        print("File processing failed")
