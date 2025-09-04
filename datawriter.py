@@ -1,15 +1,11 @@
 #!/usr/bin/env python3
 # coding: utf8
 
-import tempfile
-import xml.etree.ElementTree as ET
-import os
+import re
 import struct
 import datetime
 import logging
-import re
 import csv
-from io import StringIO
 from pathlib import Path
 
 # Conditional import of pyshark
@@ -21,7 +17,7 @@ except ImportError:
     pyshark = None
 
 class DataWriter:
-    """Enhanced PCAP writing and PDML XML conversion using PyShark with Wireshark dissector integration"""
+    """Enhanced PCAP writing with Wireshark dissector integration"""
 
     def __init__(self):
         self.port_cp = 4729
@@ -31,386 +27,630 @@ class DataWriter:
         self.eth_hdr = b'\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x00\x08\x00'
         self.logger = logging.getLogger(__name__)
 
-        # Dissector directory path
-        self.dissector_path = Path(__file__).parent / "dissector"
-        
-        # Cache for parsed dissector field definitions
-        self._dissector_fields_cache = {}
-        
-        # Enhanced dissector field mappings using actual Wireshark dissector files
-        self.protocol_dissectors = {
-            'lte_rrc': self._extract_fields_from_dissector,
-            'nr_rrc': self._extract_fields_from_dissector,
-            'nas_eps': self._extract_fields_from_dissector,
-            'nas_5gs': self._extract_fields_from_dissector,
-            'rrc': self._extract_fields_from_dissector,
-            'gsm_a': self._extract_fields_from_dissector,
-            'gsm_a_common': self._extract_fields_from_dissector,
-            'gsm_a_rr': self._extract_fields_from_dissector,
-            'gsm_a_gm': self._extract_fields_from_dissector,
-            'gsm_a_rp': self._extract_fields_from_dissector,
-            'gsmtap': self._extract_fields_from_dissector,
-            'mac_lte': self._extract_fields_from_dissector,
-            'rlc_lte': self._extract_fields_from_dissector,
-            'pdcp_lte': self._extract_fields_from_dissector
-        }
-        
-        # Initialize dissector field definitions
-        self._load_dissector_fields()
-        
-        # CSV export data - separate for RRC and NAS
+        # CSV export data
         self._rrc_packets_data = []
-        self._nas_packets_data = []
         self._all_rrc_fields = set()
-        self._all_nas_fields = set()
+
+        # Separate data structures for RRC and NAS packets
+        self._rrc_packets_only = []
+        self._nas_packets_only = []
+        self._rrc_fields_only = set()
+        self._nas_fields_only = set()
+
         self._packet_count = 0
 
-    def _load_dissector_fields(self):
-        """Load field definitions from Wireshark dissector files"""
+        # Optimized layer filtering sets for faster lookup
+        self._transport_layers = frozenset(['ip', 'eth', 'udp', 'tcp', 'frame', 'geninfo'])
+
+        # Core mobile network protocols - removed peripheral/specialized protocols
+        self._protocol_keywords = frozenset([
+            'rrc',     # Radio Resource Control (all generations)
+            'nas',     # Non-Access Stratum (all generations)
+            'mac',     # Medium Access Control
+            'rlc',     # Radio Link Control
+            'pdcp',    # Packet Data Convergence Protocol
+            'gsm',     # GSM core protocols
+            'umts',    # UMTS core protocols
+            'lte',     # LTE core protocols
+            'nr'       # NR/5G core protocols
+        ])
+
+        # Removed protocols (peripheral/specialized):
+        # fp, llc, gprs, gprscdr, map, sms, dtap, cbch, gsup, bssgp,
+        # ranap, s1ap, ngap, x2ap, xnap, gtp, sgsap, rsl, sabp, cell_broadcast
+
+        # UMTS RRC fields to include in CSV output
+        self._umts_rrc_fields = frozenset([
+            'rrc_firstsegment_element',
+            'rrc_lastsegmentshort_element',
+            'rrc_subsequentsegment_element',
+            'rrc_schedulinginfo_element',
+            'rrc_schedulinginformationsibsb_element',
+            'rrc_sib_data_fixed',
+            'rrc_sib_data_variable',
+            'rrc_sib_type',
+            'rrc_sibsb_type'
+        ])
+
+    def _identify_packet_protocol(self, packet):
+        """Identify the actual protocol from packet layers"""
         try:
-            # Map protocol names to dissector files
-            dissector_files = {
-                'lte_rrc': 'packet-lte-rrc.c',
-                'nr_rrc': 'packet-nr-rrc.c',
-                'nas_eps': 'packet-nas_eps.c',
-                'nas_5gs': 'packet-nas_5gs.c',
-                'rrc': 'packet-rrc.c',
-                'gsm_a': 'packet-gsm_a_common.c',
-                'gsm_a_common': 'packet-gsm_a_common.c',
-                'gsm_a_rr': 'packet-gsm_a_rr.c',
-                'gsm_a_gm': 'packet-gsm_a_gm.c',
-                'gsm_a_rp': 'packet-gsm_a_rp.c',
-                'gsmtap': 'packet-gsmtap.c',
-                'mac_lte': 'packet-mac-lte.c',    # May not exist, will handle gracefully
-                'rlc_lte': 'packet-rlc-lte.c',    # May not exist, will handle gracefully
-                'pdcp_lte': 'packet-pdcp-lte.c'   # May not exist, will handle gracefully
+            protocol_info = {
+                'primary_protocol': 'unknown',
+                'nested_protocol': 'unknown',
+                'channel_type': 'unknown',
+                'message_type': 'unknown',
+                'direction': 'unknown'
             }
             
-            for protocol, filename in dissector_files.items():
-                dissector_file = self.dissector_path / filename
-                if dissector_file.exists():
-                    self._dissector_fields_cache[protocol] = self._parse_dissector_fields(dissector_file, protocol)
-                    self.logger.debug(f"Loaded {len(self._dissector_fields_cache[protocol])} fields for {protocol}")
-                else:
-                    self.logger.debug(f"Dissector file not found: {dissector_file}")
-                    self._dissector_fields_cache[protocol] = {}
-                    
-        except Exception as e:
-            self.logger.warning(f"Error loading dissector fields: {e}")
-            # Initialize empty cache for all protocols to prevent errors
-            for protocol in ['lte_rrc', 'nr_rrc', 'nas_eps', 'nas_5gs', 'rrc', 'gsm_a', 'gsm_a_common', 'gsm_a_rr', 'gsm_a_gm', 'gsm_a_rp', 'gsmtap', 'mac_lte', 'rlc_lte', 'pdcp_lte']:
-                self._dissector_fields_cache[protocol] = {}
-
-    def _parse_dissector_fields(self, dissector_file, protocol):
-        """Parse field definitions from a Wireshark dissector C file"""
-        fields = {}
-        try:
-            with open(dissector_file, 'r', encoding='utf-8', errors='ignore') as f:
-                content = f.read()
-            
-            # Pattern to match Wireshark field definitions like:
-            # { &hf_lte_rrc_measId,
-            #   { "measId", "lte-rrc.measId",
-            #     FT_UINT32, BASE_DEC, NULL, 0,
-            #     NULL, HFILL }},
-            
-            field_pattern = re.compile(
-                r'{\s*&(hf_[^,]+),\s*'  # Field variable name
-                r'{\s*"([^"]+)",\s*'     # Field display name
-                r'"([^"]+)",\s*'         # Field filter name
-                r'([^,]+),\s*'           # Field type
-                r'([^,]+),\s*'           # Base
-                r'([^,]+),\s*'           # Value string/NULL
-                r'([^,]+),\s*'           # Mask
-                r'"?([^"]*)"?,\s*'       # Description (optional)
-                r'HFILL\s*}',            # HFILL ending
-                re.MULTILINE | re.DOTALL
-            )
-            
-            matches = field_pattern.findall(content)
-            
-            for match in matches:
-                hf_name, display_name, filter_name, field_type, base, value_string, mask, description = match
-                
-                # Clean up the field information
-                fields[hf_name] = {
-                    'display_name': display_name.strip(),
-                    'filter_name': filter_name.strip(),
-                    'field_type': field_type.strip(),
-                    'base': base.strip(),
-                    'value_string': value_string.strip(),
-                    'mask': mask.strip(),
-                    'description': description.strip() if description else display_name.strip()
-                }
-            
-            self.logger.info(f"Parsed {len(fields)} field definitions from {dissector_file.name}")
-            return fields
-            
-        except Exception as e:
-            self.logger.error(f"Error parsing dissector file {dissector_file}: {e}")
-            return {}
-
-    def _extract_fields_from_dissector(self, proto_elem, layer):
-        """Extract fields using actual Wireshark dissector definitions"""
-        try:
-            layer_name = layer.layer_name.lower()
-            
-            # Get protocol-specific field definitions
-            protocol_fields = self._dissector_fields_cache.get(layer_name, {})
-            
-            # Add fake-field-wrapper for compatibility
-            fake_wrapper = ET.SubElement(proto_elem, "proto")
-            fake_wrapper.set("name", "fake-field-wrapper")
-            fake_wrapper.set("showname", f"{layer_name.upper()} Protocol Fields (from dissector)")
-            
-            # Extract fields available in the layer
-            if hasattr(layer, 'field_names'):
-                available_fields = layer.field_names
-                
-                for field_name in available_fields:
-                    try:
-                        field_value = getattr(layer, field_name, None)
-                        if field_value is not None:
-                            # Look for matching dissector field definition
-                            matching_hf = self._find_matching_field_definition(field_name, protocol_fields, layer_name)
-                            
-                            if matching_hf:
-                                field_info = protocol_fields[matching_hf]
-                                field_elem = ET.SubElement(fake_wrapper, "field")
-                                field_elem.set("name", field_info['filter_name'])
-                                field_elem.set("showname", f"{field_info['display_name']}: {field_value}")
-                                field_elem.set("show", str(field_value))
-                                field_elem.set("value", self._format_field_value(field_value))
-                                field_elem.set("size", "0")
-                                field_elem.set("pos", "0")
-                                
-                                # Add field type information as comment
-                                if field_info['description']:
-                                    field_elem.set("description", field_info['description'])
-                                
-                                # Add specialized information for certain protocols
-                                if layer_name == 'gsmtap':
-                                    self._add_gsmtap_specialized_info(field_elem, field_name, field_value, field_info)
-                                elif layer_name.startswith('gsm_a_'):
-                                    self._add_gsm_a_specialized_info(field_elem, field_name, field_value, field_info, layer_name)
-                            else:
-                                # Fallback: create field with basic information
-                                field_elem = ET.SubElement(fake_wrapper, "field")
-                                field_elem.set("name", f"{layer_name}.{field_name}")
-                                field_elem.set("showname", f"{field_name}: {field_value}")
-                                field_elem.set("show", str(field_value))
-                                field_elem.set("value", self._format_field_value(field_value))
-                                field_elem.set("size", "0")
-                                field_elem.set("pos", "0")
-                                
-                    except Exception as e:
-                        continue  # Skip problematic fields
-            
-            # If no fields were extracted, add a note
-            if len(fake_wrapper) == 0:
-                note_field = ET.SubElement(fake_wrapper, "field")
-                note_field.set("name", f"{layer_name}.info")
-                note_field.set("show", f"No extractable fields found for {layer_name}")
-                note_field.set("showname", f"Protocol Info: {layer_name} layer detected")
-                
-        except Exception as e:
-            self._add_error_field(proto_elem, f'{layer_name}_dissector_extraction_error', 
-                                f'Dissector extraction error for {layer_name}: {e}')
-
-    def _add_gsmtap_specialized_info(self, field_elem, field_name, field_value, field_info):
-        """Add specialized information for GSMTAP protocol fields"""
-        try:
-            # Add GSMTAP-specific field information
-            if 'type' in field_name:
-                field_elem.set("gsmtap_type", "payload_type")
-            elif 'burst_type' in field_name:
-                field_elem.set("gsmtap_burst", "burst_type")
-            elif 'channel_type' in field_name:
-                field_elem.set("gsmtap_channel", "channel_type")
-            elif 'arfcn' in field_name:
-                field_elem.set("gsmtap_radio", "frequency")
-            elif 'signal_dbm' in field_name:
-                field_elem.set("gsmtap_radio", "signal_strength")
-            elif 'snr_db' in field_name:
-                field_elem.set("gsmtap_radio", "signal_quality")
-        except Exception:
-            pass
-
-    def _add_gsm_a_specialized_info(self, field_elem, field_name, field_value, field_info, layer_name):
-        """Add specialized information for GSM A-interface protocol fields"""
-        try:
-            # Add GSM A-interface specific field information
-            if layer_name == 'gsm_a_rr':
-                if 'cause' in field_name:
-                    field_elem.set("gsm_a_rr", "radio_resource_cause")
-                elif 'channel' in field_name:
-                    field_elem.set("gsm_a_rr", "channel_information")
-                elif 'measurement' in field_name:
-                    field_elem.set("gsm_a_rr", "measurement_data")
-            elif layer_name == 'gsm_a_gm':
-                if 'cause' in field_name:
-                    field_elem.set("gsm_a_gm", "mobility_cause")
-                elif 'identity' in field_name:
-                    field_elem.set("gsm_a_gm", "identity_information")
-                elif 'timer' in field_name:
-                    field_elem.set("gsm_a_gm", "timer_information")
-            elif layer_name == 'gsm_a_rp':
-                if 'cause' in field_name:
-                    field_elem.set("gsm_a_rp", "radio_paging_cause")
-        except Exception:
-            pass
-
-    def _extract_rrc_data_for_csv(self, packet, packet_num):
-        """Extract RRC and NAS data from packet for CSV export"""
-        try:
-            rrc_packet_data = {'packet_number': packet_num}
-            nas_packet_data = {'packet_number': packet_num}
-            has_rrc_data = False
-            has_nas_data = False
-            
-            # Look for RRC and NAS layers in the packet
+            # First try to identify from GSMTAP layer if present
             for layer in packet.layers:
                 try:
                     layer_name = layer.layer_name.lower()
                     
-                    # Skip non-RRC/NAS layers (IP, ETH, UDP, GSMTAP)
-                    if layer_name in ['ip', 'eth', 'udp', 'gsmtap', 'frame', 'geninfo']:
-                        continue
-                    
-                    # Process RRC and NAS related layers
-                    if any(protocol_type in layer_name for protocol_type in ['rrc', 'nas_eps', 'nas_5gs', 'gsm_a']):
-                        self._extract_layer_fields_for_separate_csv(layer, layer_name, rrc_packet_data, nas_packet_data)
+                    if layer_name == 'gsmtap':
+                        # Try to get GSMTAP protocol info
+                        if hasattr(layer, 'field_names'):
+                            for field_name in layer.field_names:
+                                field_name_lower = field_name.lower()
+                                field_value = getattr(layer, field_name, None)
+                                if field_value:
+                                    if 'type' in field_name.lower():
+                                        # Map GSMTAP type to protocol
+                                        try:
+                                            gsmtap_type = int(field_value)
+                                            if gsmtap_type == 0x0d:  # LTE RRC
+                                                protocol_info['primary_protocol'] = 'lte_rrc'
+                                            elif gsmtap_type == 0x12:  # LTE NAS
+                                                protocol_info['primary_protocol'] = 'nas_eps'
+                                            elif gsmtap_type == 0x0e:  # LTE MAC
+                                                protocol_info['primary_protocol'] = 'mac_lte'
+                                            elif gsmtap_type == 0x0f:  # LTE MAC Framed
+                                                protocol_info['primary_protocol'] = 'mac_lte'
+                                            elif gsmtap_type == 0x0c:  # UMTS RRC
+                                                protocol_info['primary_protocol'] = 'umts_rrc'
+                                            elif gsmtap_type == 0x01:  # GSM UM
+                                                protocol_info['primary_protocol'] = 'gsm_um'
+                                            elif gsmtap_type == 0x02:  # GSM ABIS
+                                                protocol_info['primary_protocol'] = 'gsm_abis'
+                                            elif gsmtap_type == 0x10:  # Osmocom
+                                                protocol_info['primary_protocol'] = 'osmocore'
+                                            elif gsmtap_type == 0x11:  # Qualcomm
+                                                protocol_info['primary_protocol'] = 'qc_diag'
+                                        except (ValueError, TypeError):
+                                            pass
+                                    
+                                    # Channel type detection from GSMTAP fields
+                                    if 'subtype' in field_name_lower or 'sub_type' in field_name_lower or 'channel' in field_name_lower:
+                                        if field_value and str(field_value) != '0':
+                                            protocol_info['channel_type'] = str(field_value)
+
+                                    # Direction detection from GSMTAP fields
+                                    if 'direction' in field_name_lower or 'dir' in field_name_lower:
+                                        if str(field_value).lower() in ['0', 'uplink', 'ul', 'up']:
+                                            protocol_info['direction'] = 'uplink'
+                                        elif str(field_value).lower() in ['1', 'downlink', 'dl', 'down']:
+                                            protocol_info['direction'] = 'downlink'
+                                        elif field_value and str(field_value) != '0':
+                                            # Handle other direction values that might be display strings
+                                            direction_str = str(field_value).lower()
+                                            if 'uplink' in direction_str or 'ul' in direction_str:
+                                                protocol_info['direction'] = 'uplink'
+                                            elif 'downlink' in direction_str or 'dl' in direction_str:
+                                                protocol_info['direction'] = 'downlink'
+
+                        break
                         
-                        # Check if we have data in either category
-                        if any(key != 'packet_number' for key in rrc_packet_data.keys()):
-                            has_rrc_data = True
-                        if any(key != 'packet_number' for key in nas_packet_data.keys()):
-                            has_nas_data = True
+                except Exception as e:
+                    continue
+            
+            # If no GSMTAP info, try to identify from other layers
+            if protocol_info['primary_protocol'] == 'unknown':
+                for layer in packet.layers:
+                    try:
+                        layer_name = layer.layer_name.lower()
+
+                        # Skip transport layers
+                        if layer_name in self._transport_layers:
+                            continue
+
+                        # Identify primary protocol from layer names
+                        if 'rrc' in layer_name:
+                            if 'lte' in layer_name:
+                                protocol_info['primary_protocol'] = 'lte_rrc'
+                                # Check for nested NAS-EPS in LTE RRC
+                                if any('nas' in l.layer_name.lower() for l in packet.layers):
+                                    protocol_info['nested_protocol'] = 'nas_eps'
+                            elif 'nr' in layer_name:
+                                protocol_info['primary_protocol'] = 'nr_rrc'
+                                # Check for nested NAS-5GS in NR RRC
+                                if any('nas' in l.layer_name.lower() for l in packet.layers):
+                                    protocol_info['nested_protocol'] = 'nas_5gs'
+                            elif 'umts' in layer_name:
+                                protocol_info['primary_protocol'] = 'umts_rrc'
+                                # Check for nested NAS-EPS in UMTS RRC
+                                if any('nas' in l.layer_name.lower() for l in packet.layers):
+                                    protocol_info['nested_protocol'] = 'nas_eps'
+                            else:
+                                protocol_info['primary_protocol'] = 'rrc'
+
+                            # Check for dedicatedInfoNAS field within RRC layers
+                            if hasattr(layer, 'field_names'):
+                                for field_name in layer.field_names:
+                                    field_name_lower = field_name.lower()
+                                    # Check for various NAS-related fields in RRC
+                                    nas_indicators = [
+                                        'dedicatedinfonas', 'dedicated_info_nas',
+                                        'dedicatedinfonaslist', 'dedicated_info_nas_list',
+                                        'nas_message', 'nas_msg', 'emm_msg', 'esm_msg', 'nas_msg_type', 'emm_type', 'esm_type', 'message_type',
+                                    ]
+
+                                    if any(indicator in field_name_lower for indicator in nas_indicators):
+                                        field_value = getattr(layer, field_name, None)
+                                        if field_value and str(field_value).strip() and str(field_value) != '0':
+                                            # This RRC packet contains NAS data
+
+                                            if 'lte' in layer_name:
+                                                protocol_info['nested_protocol'] = 'nas_eps'
+                                            elif 'nr' in layer_name:
+                                                protocol_info['nested_protocol'] = 'nas_5gs'
+                                            elif 'umts' in layer_name:
+                                                protocol_info['nested_protocol'] = 'nas_eps'
+                        elif 'nas' in layer_name:
+                            if 'eps' in layer_name:
+                                protocol_info['primary_protocol'] = 'nas_eps'
+                            elif '5gs' in layer_name:
+                                protocol_info['primary_protocol'] = 'nas_5gs'
+                            else:
+                                protocol_info['primary_protocol'] = 'nas'
+                        elif 'mac' in layer_name:
+                            if 'lte' in layer_name:
+                                protocol_info['primary_protocol'] = 'mac_lte'
+                            elif 'nr' in layer_name:
+                                protocol_info['primary_protocol'] = 'mac_nr'
+                            elif 'umts' in layer_name:
+                                protocol_info['primary_protocol'] = 'mac_umts'
+                            else:
+                                protocol_info['primary_protocol'] = 'mac'
+                        elif 'rlc' in layer_name:
+                            if 'lte' in layer_name:
+                                protocol_info['primary_protocol'] = 'rlc_lte'
+                            elif 'nr' in layer_name:
+                                protocol_info['primary_protocol'] = 'rlc_nr'
+                            elif 'umts' in layer_name:
+                                protocol_info['primary_protocol'] = 'rlc_umts'
+                            else:
+                                protocol_info['primary_protocol'] = 'rlc'
+                        elif 'pdcp' in layer_name:
+                            if 'lte' in layer_name:
+                                protocol_info['primary_protocol'] = 'pdcp_lte'
+                            elif 'nr' in layer_name:
+                                protocol_info['primary_protocol'] = 'pdcp_nr'
+                            else:
+                                protocol_info['primary_protocol'] = 'pdcp'
+                        elif 'rlcmac' in layer_name:
+                            protocol_info['primary_protocol'] = 'gsm_rlcmac'
+                        elif 'gsm' in layer_name:
+                            protocol_info['primary_protocol'] = 'gsm'
+                        elif 'umts' in layer_name:
+                            protocol_info['primary_protocol'] = 'umts'
+                        elif 'lte' in layer_name:
+                            protocol_info['primary_protocol'] = 'lte'
+                        elif 'nr' in layer_name:
+                            protocol_info['primary_protocol'] = 'nr'
+                        
+                    except Exception as e:
+                        continue
+            
+            # Final attempt: analyze field values for message types and channels
+            if protocol_info['message_type'] == 'unknown' or protocol_info['channel_type'] == 'unknown':
+                for layer in packet.layers:
+                    try:
+                        layer_name = layer.layer_name.lower()
+                        if layer_name in self._transport_layers:
+                            continue
                             
+                        if hasattr(layer, 'field_names'):
+                            for field_name in layer.field_names:
+                                field_value = getattr(layer, field_name, None)
+                                if field_value:
+                                    # Only check fields with message, type, or element in the name for efficiency
+                                    field_name_lower = str(field_name).lower()
+                                    if not any(keyword in field_name_lower for keyword in ['message', 'type', 'element', 'ul', 'invalid', 'short', 'discriminator']):
+                                        continue
+
+                                    field_str = str(field_value).lower()
+
+                                    # Message type detection from field values
+                                    if protocol_info['message_type'] == 'unknown':
+                                        # Consolidated message type patterns
+                                        message_patterns = [
+                                            'connection', 'setup', 'release', 'reconfig', 'reestablishment',
+                                            'attach', 'detach', 'update', 'request', 'response', 'complete',
+                                            'reject', 'failure', 'handover', 'measurement', 'security', 'active',
+                                            'capability', 'information', 'system', 'paging', 'broadcast',
+                                            'authentication', 'location', 'routing', 'service',
+                                            'pdn', 'bearer', 'session', 'registration', 'deregistration',
+                                            'configuration', 'notification', 'rrcconnection', 'connectionrequest',
+                                            'connectionsetup', 'connectioncomplete', 'connectionreject',
+                                            'connectionrelease', 'handovercommand', 'handovercomplete',
+                                            'measurementreport', 'securitymode', 'uecapability', 'systeminformation',
+                                            'masterinformation', 'sib', 'systeminfo', 'segment', 'sibsb', 'procedure', 'protocol'
+                                        ]
+                                        
+                                        if re.match(r'^0x[0-9a-fA-F]+$', field_str):
+                                            # Check for priority prefixes including continuation for 0x4XXX, 0x5XXX, 0x6XXX
+                                            if (re.match(r'^0x[4567acd][0-9a-fA-F]+$', field_str) and len(field_str) <= 6):
+                                                field_str = str(self._get_display_value_from_field(layer, field_name, field_str)).lower()
+                                      
+                                        if any(msg in field_str for msg in message_patterns):
+                                            display_value = self._get_display_value_from_field(layer, field_name, field_value)
+                                            protocol_info['message_type'] = display_value
+
+                                    # Channel type detection from field values
+                                    if protocol_info['channel_type'] == 'unknown':
+                                        # Common channel types
+                                        if any(channel in field_str for channel in [
+                                            'ccch', 'dcch', 'bcch', 'pcch', 'mcch', 'scch',
+                                            'uplink', 'downlink', 'ul', 'dl', 'broadcast', 'control',
+                                            'traffic', 'signaling', 'data'
+                                        ]):
+                                            protocol_info['channel_type'] = str(field_value)
+                                        # Don't set to '-1' here - let it remain 'unknown' if not detected
+
+                                    # Direction detection from field values
+                                    if protocol_info['direction'] == 'unknown':
+                                        if any(dir_pattern in field_str for dir_pattern in ['uplink', 'ul', 'up']):
+                                            protocol_info['direction'] = 'uplink'
+                                        elif any(dir_pattern in field_str for dir_pattern in ['downlink', 'dl', 'down']):
+                                            protocol_info['direction'] = 'downlink'
+                                        # Don't set to '-1' here - let it remain 'unknown' if not detected
+
+                    except Exception as e:
+                        continue
+            
+            # Final check: ensure nested protocol is detected
+            if protocol_info['nested_protocol'] == 'unknown':
+                all_layer_names = [l.layer_name.lower() for l in packet.layers]
+
+                # Check for common nested protocol patterns
+                if protocol_info['primary_protocol'] == 'lte_rrc' and any('nas' in name for name in all_layer_names):
+                    protocol_info['nested_protocol'] = 'nas_eps'
+                elif protocol_info['primary_protocol'] == 'nr_rrc' and any('nas' in name for name in all_layer_names):
+                    protocol_info['nested_protocol'] = 'nas_5gs'
+                elif protocol_info['primary_protocol'] == 'umts_rrc' and any('nas' in name for name in all_layer_names):
+                    protocol_info['nested_protocol'] = 'nas_eps'
+                else:
+                    protocol_info['nested_protocol'] = '-1'
+
+
+                # Check for UMTS RRC payload in DATA layer
+                if protocol_info['primary_protocol'] == 'umts_rrc':
+                    for layer in packet.layers:
+                        if layer.layer_name.lower() == 'data' and hasattr(layer, 'field_names'):
+                            # Check if DATA layer has UMTS RRC fields
+                            if any('rrc_' in field_name.lower() for field_name in layer.field_names):
+                                protocol_info['primary_protocol'] = 'umts_rrc'  # Ensure it's set
+                                break
+
+                # Check for NAS-related fields in any RRC layer and enhance info field
+                for layer in packet.layers:
+                    if 'rrc' in layer.layer_name.lower() and hasattr(layer, 'field_names'):
+                        for field_name in layer.field_names:
+                            field_name_lower = field_name.lower()
+                            # Check for various NAS-related fields in RRC
+                            nas_indicators = [
+                                'dedicatedinfonas', 'dedicated_info_nas',
+                                'dedicatedinfonaslist', 'dedicated_info_nas_list',
+                                'nas_message', 'nas_msg', 'emm_msg', 'esm_msg', 'nas_msg_type', 'nas_msg_emm_type', 'nas_msg_esm_type', 'emm_type', 'esm_type', 'message_type',
+                            ]
+
+                            if any(indicator in field_name_lower for indicator in nas_indicators):
+                                field_value = getattr(layer, field_name, None)
+                                if field_value and str(field_value).strip() and str(field_value) != '0':
+                                    # Found NAS data in RRC packet
+
+                                    if 'lte' in layer.layer_name.lower():
+                                        protocol_info['nested_protocol'] = 'nas_eps'
+                                    elif 'nr' in layer.layer_name.lower():
+                                        protocol_info['nested_protocol'] = 'nas_5gs'
+                                    elif 'umts' in layer.layer_name.lower():
+                                        protocol_info['nested_protocol'] = 'nas_eps'
+                                    break
+
+                            # Enhanced message type extraction for system messages
+                            if protocol_info['message_type'] == 'unknown':
+                                # Check for BCCH-BCH message (MasterInformationBlock)
+                                if 'bcch_bch_message' in field_name_lower:
+                                    protocol_info['message_type'] = 'MasterInformationBlock'
+                                # Check for system information blocks
+                                elif 'systeminformationblock' in field_name_lower and 'type' in field_name_lower:
+                                    field_value = getattr(layer, field_name, None)
+                                    if field_value and str(field_value) != '0':
+                                        protocol_info['message_type'] = f'SIB{field_value}'
+
+            # Final fallback: set unknown values to '-1'
+            if protocol_info['channel_type'] == 'unknown':
+                protocol_info['channel_type'] = '-1'
+            if protocol_info['direction'] == 'unknown':
+                protocol_info['direction'] = '-1'
+            if protocol_info['message_type'] == 'unknown':
+                protocol_info['message_type'] = '-1'
+
+            return protocol_info
+                
+        except Exception as e:
+            self.logger.debug(f"Error identifying packet protocol: {e}")
+            return {
+                'primary_protocol': 'unknown',
+                'nested_protocol': 'unknown',
+                'channel_type': 'unknown',
+                'message_type': 'unknown',
+                'direction': 'unknown'
+            }
+
+    def _extract_rrc_data_for_csv(self, packet, packet_num):
+        """Extract all protocol data from packet for CSV export"""
+        try:
+            packet_data = {'packet_number': packet_num}
+            has_protocol_data = False
+
+            # First, identify protocol from packet layers
+            protocol_info = self._identify_packet_protocol(packet)
+            packet_data['nested_protocol'] = protocol_info['nested_protocol']
+            packet_data['message_type'] = protocol_info['message_type']
+            packet_data['channel_type'] = protocol_info['channel_type']
+            packet_data['direction'] = protocol_info['direction']
+
+            # Process all relevant layers in the packet
+            for layer in packet.layers:
+                try:
+                    layer_name = layer.layer_name.lower()
+
+                    # Skip transport layers (optimized with frozenset)
+                    if layer_name in self._transport_layers:
+                        continue
+
+                    # Process all protocol layers (not just RRC) - optimized with frozenset
+                    if any(protocol in layer_name for protocol in self._protocol_keywords):
+                        has_protocol_data = True
+                        # Extract fields from this protocol layer (e.g., nas_eps, lte_rrc)
+                        self._extract_layer_fields_for_csv(layer, layer_name, packet_data)
+                    # Special handling for UMTS RRC packets - their payload is in DATA layer
+                    elif layer_name == 'data' and hasattr(packet, 'gsmtap'):
+                        gsmtap_type = getattr(packet.gsmtap, 'type', None)
+                        if gsmtap_type and str(gsmtap_type) == '12':  # UMTS RRC
+                            has_protocol_data = True
+                            # Extract UMTS RRC fields from DATA layer
+                            self._extract_layer_fields_for_csv(layer, 'umts_rrc', packet_data)
+                    # Also process GSMTAP layer for metadata and transport info
+                    elif layer_name == 'gsmtap':
+                        has_protocol_data = True
+                        # Extract GSMTAP metadata (protocol type, subtype, etc.)
+                        self._extract_layer_fields_for_csv(layer, layer_name, packet_data)
+
                 except Exception as e:
                     self.logger.debug(f"Error processing layer in packet {packet_num}: {e}")
                     continue
-            
-            # Add packets to appropriate data lists
-            if has_rrc_data:
-                self._rrc_packets_data.append(rrc_packet_data)
-            if has_nas_data:
-                self._nas_packets_data.append(nas_packet_data)
-                
-            if has_rrc_data or has_nas_data:
+
+            # Add packet if it contains any protocol data
+            if has_protocol_data:
+                self._rrc_packets_data.append(packet_data)
                 self._packet_count += 1
+
+                # Categorize packet for separate RRC/NAS CSV exports
+                packet_type = self._determine_packet_type(packet_data, packet)
+
+                # Collect fields for RRC/NAS specific exports
+                for key, value in packet_data.items():
+                    # Normalize key to use underscores for consistent processing
+                    normalized_key = key.replace('-', '_').replace('.', '_')
+                    field_protocol = self._determine_field_protocol(normalized_key)
+
+                    # Add field to appropriate protocol field sets based on field type and packet type
+                    if field_protocol == 'both':
+                        # GSMTAP and protocol identification fields go to both
+                        if packet_type in ['rrc', 'nas']:
+                            self._rrc_fields_only.add(key)
+                            self._nas_fields_only.add(key)
+                    elif field_protocol == 'rrc':
+                        # RRC-specific fields only go to RRC (only if packet is RRC type)
+                        if packet_type == 'rrc':
+                            self._rrc_fields_only.add(key)
+                    elif field_protocol == 'nas':
+                        # NAS-specific fields only go to NAS (only if packet is NAS type)
+                        if packet_type == 'nas':
+                            self._nas_fields_only.add(key)
+                    # For unknown fields, include them in both if they're not transport-related
+                    elif field_protocol == 'unknown' and not any(transport in key.lower() for transport in ['ip.', 'eth.', 'udp.', 'tcp.', 'frame.', 'geninfo.']):
+                        # Include unknown protocol fields in both RRC and NAS for comprehensive coverage
+                        if packet_type in ['rrc', 'nas']:
+                            self._rrc_fields_only.add(key)
+                            self._nas_fields_only.add(key)
+
+                # Add packet to appropriate separate data structure
+                if packet_type == 'rrc':
+                    self._rrc_packets_only.append(packet_data)
+                elif packet_type == 'nas':
+                    self._nas_packets_only.append(packet_data)
                 
         except Exception as e:
-            self.logger.debug(f"Error extracting RRC/NAS data for CSV: {e}")
+            self.logger.debug(f"Error extracting protocol data for CSV: {e}")
 
-    def _extract_layer_fields_for_separate_csv(self, layer, layer_name, rrc_packet_data, nas_packet_data):
-        """Extract fields from a layer and categorize them for separate RRC/NAS CSV export"""
+    def _determine_field_protocol(self, field_name):
+        """Determine which protocol a field belongs to based on field name"""
+        field_lower = field_name.lower()
+        field_normalized = field_name.lower().replace('-', '_').replace('.', '_')
+
+        # GSMTAP fields belong to both (metadata)
+        if field_lower.startswith('gsmtap.'):
+            return 'both'
+
+        # Protocol identification fields belong to both
+        if field_name in ['packet_number', 'nested_protocol', 'message_type', 'channel_type', 'direction']:
+            return 'both'
+
+        # RRC-specific fields (exclude from NAS)
+        if any(keyword in field_normalized for keyword in ['rrc', 'lte_rrc', 'umts_rrc', 'nr_rrc']):
+            return 'rrc'
+
+        # NAS-specific fields (only include nas_eps and gsm_a as requested)
+        # Be very specific to only include these exact protocol prefixes
+        if (field_normalized.startswith('nas_eps') or
+            field_normalized.startswith('gsm_a')):
+            return 'nas'
+
+        # Default to unknown (will be skipped)
+        return 'unknown'
+
+    def _determine_packet_type(self, packet_data, packet):
+        """Determine if packet is RRC or NAS based on nested_protocol and gsmtap.type"""
+        nested_protocol = packet_data.get('nested_protocol', 'unknown')
+
+        # Check nested_protocol first
+        if 'nas' in nested_protocol.lower():
+            return 'nas'
+        elif 'rrc' in nested_protocol.lower():
+            return 'rrc'
+
+        # Fallback: check gsmtap.type for additional hints
+        if hasattr(packet, 'gsmtap'):
+            gsmtap_type = getattr(packet.gsmtap, 'type', None)
+            if gsmtap_type is not None:
+                gsmtap_type_str = str(gsmtap_type)
+                # Handle both raw numbers and display strings
+                if '12' in gsmtap_type_str and 'UMTS RRC' in gsmtap_type_str:
+                    return 'rrc'  # UMTS RRC type 12 (0x0c)
+                elif '13' in gsmtap_type_str and 'LTE RRC' in gsmtap_type_str:
+                    return 'rrc'  # LTE RRC type 13 (0x0d)
+                elif '12' in gsmtap_type_str and 'LTE NAS' in gsmtap_type_str:
+                    return 'nas'  # LTE NAS type 18 (0x12)
+                elif '0' in gsmtap_type_str and 'NR' in gsmtap_type_str:
+                    return 'nas'  # NR NAS
+                # Also handle raw numeric values
+                elif gsmtap_type_str == '12':
+                    return 'rrc'  # UMTS RRC
+                elif gsmtap_type_str == '13':
+                    return 'rrc'  # LTE RRC
+                elif gsmtap_type_str == '18':
+                    return 'nas'  # LTE NAS
+
+        return 'unknown'
+
+    def _get_display_value_from_field(self, layer, field_name, raw_value):
+        """Get the display value from dissector field if available"""
         try:
-            # Get protocol-specific field definitions
-            protocol_fields = self._dissector_fields_cache.get(layer_name, {})
-            
+            # Try to get the field object which may have display information
+            if hasattr(layer, field_name):
+                field_obj = getattr(layer, field_name)
+
+                # PyShark field objects have display information from the dissector
+                # Priority order: showname (most complete) > show > display
+                if hasattr(field_obj, 'showname') and field_obj.showname:
+                    return str(field_obj.showname)
+                elif hasattr(field_obj, 'show') and field_obj.show:
+                    return str(field_obj.show)
+                elif hasattr(field_obj, 'display') and field_obj.display:
+                    return str(field_obj.display)
+
+                # Some PyShark fields have additional display attributes
+                if hasattr(field_obj, 'display_name') and field_obj.display_name:
+                    return str(field_obj.display_name)
+
+                # Check if the field has a decoded value that differs from raw
+                if hasattr(field_obj, 'value'):
+                    field_value = field_obj.value
+                    # Only return the value if it's different from raw (meaning it was decoded)
+                    if str(field_value) != str(raw_value):
+                        return str(field_value)
+
+            # Fallback to raw value if no display information available
+            return str(raw_value)
+        except Exception as e:
+            self.logger.debug(f"Error getting display value for {field_name}: {e}")
+            return str(raw_value) if raw_value is not None else ''
+
+    def _extract_layer_fields_for_csv(self, layer, layer_name, packet_data):
+        """Extract fields from a layer for CSV export"""
+        try:
             if hasattr(layer, 'field_names'):
-                # Limit the number of fields to process to prevent infinite loops
-                field_names = list(layer.field_names)[:50]  # Process max 50 fields per layer
+                # Process all available fields for comprehensive extraction
+                field_names = list(layer.field_names)
+
                 
                 for field_name in field_names:
                     try:
-                        field_value = getattr(layer, field_name, None)
-                        if field_value is not None:
-                            # Create proper field name using dissector definitions
-                            matching_hf = self._find_matching_field_definition(field_name, protocol_fields, layer_name)
-                            
-                            if matching_hf and matching_hf in protocol_fields:
-                                field_info = protocol_fields[matching_hf]
-                                csv_field_name = field_info.get('filter_name', f"{layer_name}.{field_name}")
+                        raw_field_value = getattr(layer, field_name, None)
+                        if raw_field_value is not None and raw_field_value != '':
+                            # Filter UMTS RRC fields to only include specified ones
+                            if layer_name == 'umts_rrc' and normalized_field_name not in self._umts_rrc_fields:
+                                continue
+
+                            # Create CSV field name using layer name and field name
+                            # Normalize both layer name and field name to use underscores for consistent syntax
+                            normalized_layer_name = layer_name.replace('-', '_').replace('.', '_')
+                            normalized_field_name = field_name.replace('-', '_').replace('.', '_')
+                            csv_field_name = f"{normalized_layer_name}.{normalized_field_name}"
+
+                            # Try to get the display value (readable text) instead of raw value
+                            field_value = self._get_display_value_from_field(layer, field_name, raw_field_value)
+
+                            # Convert field value to string and handle special cases
+                            if isinstance(field_value, (list, tuple)):
+                                field_value = ','.join(str(v) for v in field_value)
+                            elif isinstance(field_value, dict):
+                                field_value = str(field_value)
                             else:
-                                csv_field_name = f"{layer_name}.{field_name}"
-                            
-                            # Categorize the field
-                            field_category = self._categorize_field(csv_field_name, layer_name)
-                            
-                            # Add field to appropriate packet data and global field sets
-                            if field_category == 'rrc':
-                                rrc_packet_data[csv_field_name] = str(field_value)
+                                field_value = str(field_value)
+
+                            # Only add meaningful values (not empty, None, or -1)
+                            # Also filter out Wireshark expert info messages and other noise
+                            # Special handling for GSMTAP fields where '0' is a valid value
+                            is_valid_value = True
+                            if field_value in ['None', '']:
+                                is_valid_value = False
+                            elif field_value == '-1' and layer_name != 'gsmtap':
+                                # -1 might be valid for GSMTAP but not for other protocols
+                                is_valid_value = False
+                            elif field_value == '0':
+                                # '0' is invalid for most protocols but valid for GSMTAP
+                                if layer_name != 'gsmtap':
+                                    is_valid_value = False
+
+                            if (is_valid_value and
+                                len(field_value.strip()) > 0 and
+                                not field_value.startswith('Expert Info') and
+                                not field_value.startswith('All ') and
+                                not field_value.startswith('dissector bug') and
+                                not field_value.startswith('report to wireshark.org') and
+                                not 'extraneous data' in field_value.lower() and
+                                not 'later version spec' in field_value.lower()):
+
+                                packet_data[csv_field_name] = field_value
                                 self._all_rrc_fields.add(csv_field_name)
-                            elif field_category == 'nas':
-                                norm_name = self._normalize_nas_csv_field_name(csv_field_name)
-                                nas_packet_data[norm_name] = str(field_value)
-                                self._all_nas_fields.add(norm_name)
-                            # Note: 'other' category fields are not included in CSV export
                             
                     except Exception as e:
                         self.logger.debug(f"Error processing field {field_name}: {e}")
                         continue
                         
         except Exception as e:
-            self.logger.debug(f"Error extracting layer fields for separate CSV: {e}")
-
-    def _categorize_field(self, field_name, layer_name):
-        """
-        Categorize a field as RRC, NAS, or other based on layer name and field patterns
-        
-        Args:
-            field_name (str): The field name to categorize
-            layer_name (str): The protocol layer name
-            
-        Returns:
-            str: 'rrc', 'nas', or 'other'
-        """
-        try:
-            normalized_field_name = field_name.lower().replace('_', '-').replace('.', '-')
-            normalized_layer_name = layer_name.lower()
-            
-            # First priority: Field name pattern analysis (most reliable for embedded fields)
-            # Look for NAS-related patterns in field names - this catches embedded NAS fields in RRC layers
-            nas_patterns = ['nas-eps', 'nas-5gs', 'nas_eps', 'nas_5gs', 'emm', 'esm', 'gmm', 'sm-', 'mm-', 'gprs', 'gsm-a', 'attach', 'detach', 'tau', 'rai', 'tmsi', 'imsi', 'imei']
-            if any(pattern in normalized_field_name for pattern in nas_patterns):
-                return 'nas'
-            
-            # Second priority: Layer-based categorization
-            # NAS layers should always be categorized as NAS
-            if any(nas_type in normalized_layer_name for nas_type in ['nas', 'nas_eps', 'nas_5gs']):
-                return 'nas'
-            
-            # GSM A-interface layers should be categorized as NAS (they're part of NAS)
-            if any(gsm_type in normalized_layer_name for gsm_type in ['gsm_a', 'gsm_a_common', 'gsm_a_rr', 'gsm_a_gm', 'gsm_a_rp']):
-                return 'nas'
-            
-            # Look for RRC-related patterns in field names
-            rrc_patterns = ['lte-rrc', 'nr-rrc', 'rrc-', 'radio', 'resource', 'connection', 'setup', 'release', 'reconfiguration', 'measurement', 'handover', 'cell', 'paging', 'broadcast']
-            if any(pattern in normalized_field_name for pattern in rrc_patterns):
-                return 'rrc'
-            
-            # RRC layers should be categorized as RRC (after field pattern check)
-            if any(rrc_type in normalized_layer_name for rrc_type in ['rrc', 'lte_rrc', 'nr_rrc']):
-                return 'rrc'
-            
-            # Default to other for unknown fields
-            return 'other'
-            
-        except Exception as e:
-            self.logger.debug(f"Error categorizing field {field_name}: {e}")
-            return 'other'
-
-    def _normalize_nas_csv_field_name(self, field_name):
-        """Normalize NAS CSV header names by collapsing RAT RRC prefixes.
-        Examples: lte_rrc.foo -> lte.foo, lte-rrc.foo -> lte.foo, nr_rrc.foo -> nr.foo, nr-rrc.foo -> nr.foo"""
-        try:
-            return re.sub(r'^([a-z0-9]+)[-_]rrc\.', r'\1.', str(field_name).lower())
-        except Exception:
-            return field_name
+            self.logger.debug(f"Error extracting layer fields for CSV: {e}")
 
     def _export_rrc_to_csv(self, csv_output_path):
-        """Export RRC data to CSV file"""
+        """Export all protocol data to CSV file"""
         try:
             if not self._rrc_packets_data:
-                self.logger.warning("No RRC data to export to CSV")
+                self.logger.warning("No protocol data to export to CSV")
                 return
             
-            # Sort field names for consistent column ordering
-            sorted_fields = ['packet_number'] + sorted([f for f in self._all_rrc_fields])
+            # Add protocol identification columns at the beginning
+            protocol_columns = ['packet_number', 'nested_protocol', 'message_type', 'channel_type', 'direction']
             
-            self.logger.info(f"Exporting {len(self._rrc_packets_data)} RRC packets with {len(sorted_fields)} fields to CSV")
+            # Sort field names for consistent column ordering, excluding protocol columns
+            other_fields = [f for f in self._all_rrc_fields if f not in protocol_columns]
+            sorted_fields = protocol_columns + sorted(other_fields)
+            
+            self.logger.info(f"Exporting {len(self._rrc_packets_data)} packets to CSV")
             
             with open(csv_output_path, 'w', newline='', encoding='utf-8') as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=sorted_fields, restval='-1')
@@ -423,217 +663,118 @@ class DataWriter:
                     # Create row with -1 for missing fields
                     row = {}
                     for field in sorted_fields:
-                        row[field] = packet_data.get(field, '-1')
+                        if field in protocol_columns:
+                            # Use actual values for protocol columns, or 'unknown' if missing
+                            row[field] = packet_data.get(field, 'unknown')
+                        else:
+                            # Use -1 for missing data fields
+                            row[field] = packet_data.get(field, '-1')
                     writer.writerow(row)
             
-            self.logger.info(f"Successfully exported RRC data to {csv_output_path}")
-            
-        except Exception as e:
-            self.logger.error(f"Error exporting RRC data to CSV: {e}")
+            self.logger.info(f"Successfully exported protocol data to {csv_output_path}")
 
-    def _export_nas_to_csv(self, csv_output_path):
-        """Export NAS data to CSV file"""
+            # Log layer usage statistics for optimization analysis
+            self.log_layer_usage_statistics()
+
+        except Exception as e:
+            self.logger.error(f"Error exporting protocol data to CSV: {e}")
+
+    def _export_rrc_only_to_csv(self, csv_output_path):
+        """Export only RRC packets to CSV file"""
         try:
-            if not self._nas_packets_data:
-                self.logger.warning("No NAS data to export to CSV")
+            if not self._rrc_packets_only:
+                self.logger.warning("No RRC packets to export to CSV")
                 return
-            
-            # Sort field names for consistent column ordering
-            sorted_fields = ['packet_number'] + sorted([self._normalize_nas_csv_field_name(f) for f in self._all_nas_fields])
-            
-            self.logger.info(f"Exporting {len(self._nas_packets_data)} NAS packets with {len(sorted_fields)} fields to CSV")
-            
+
+            # Add protocol identification columns at the beginning
+            protocol_columns = ['packet_number', 'nested_protocol', 'message_type', 'channel_type', 'direction']
+
+            # Sort field names for consistent column ordering, excluding protocol columns
+            other_fields = [f for f in self._rrc_fields_only if f not in protocol_columns]
+            sorted_fields = protocol_columns + sorted(other_fields)
+
+            self.logger.info(f"Exporting {len(self._rrc_packets_only)} RRC packets to CSV")
+
             with open(csv_output_path, 'w', newline='', encoding='utf-8') as csvfile:
                 writer = csv.DictWriter(csvfile, fieldnames=sorted_fields, restval='-1')
-                
+
                 # Write header
                 writer.writeheader()
-                
+
                 # Write packet data
-                for packet_data in self._nas_packets_data:
+                for packet_data in self._rrc_packets_only:
                     # Create row with -1 for missing fields
                     row = {}
                     for field in sorted_fields:
-                        row[field] = packet_data.get(field, '-1')
+                        if field in protocol_columns:
+                            # Use actual values for protocol columns, or 'unknown' if missing
+                            row[field] = packet_data.get(field, 'unknown')
+                        else:
+                            # Use -1 for missing data fields
+                            row[field] = packet_data.get(field, '-1')
                     writer.writerow(row)
-            
-            self.logger.info(f"Successfully exported NAS data to {csv_output_path}")
-            
-        except Exception as e:
-            self.logger.error(f"Error exporting NAS data to CSV: {e}")
 
-    def _export_separate_rrc_nas_csv(self, base_csv_path):
-        """
-        Export RRC and NAS data to separate CSV files
-        
-        Args:
-            base_csv_path (str): Base path for CSV files (without extension)
-        """
-        try:
-            # Generate separate file paths
-            rrc_csv_path = f"{base_csv_path}_rrc.csv"
-            nas_csv_path = f"{base_csv_path}_nas.csv"
-            
-            # Export RRC data
-            if self._rrc_packets_data:
-                self._export_rrc_to_csv(rrc_csv_path)
-                print(f"RRC CSV exported to: {rrc_csv_path}")
-            else:
-                print("No RRC data found for CSV export")
-            
-            # Export NAS data
-            if self._nas_packets_data:
-                self._export_nas_to_csv(nas_csv_path)
-                print(f"NAS CSV exported to: {nas_csv_path}")
-            else:
-                print("No NAS data found for CSV export")
-                
+            self.logger.info(f"Successfully exported RRC packets to {csv_output_path}")
+
         except Exception as e:
-            self.logger.error(f"Error exporting separate RRC/NAS CSV files: {e}")
+            self.logger.error(f"Error exporting RRC packets to CSV: {e}")
+
+    def _export_nas_only_to_csv(self, csv_output_path):
+        """Export only NAS packets to CSV file"""
+        try:
+            if not self._nas_packets_only:
+                self.logger.warning("No NAS packets to export to CSV")
+                return
+
+            # Add protocol identification columns at the beginning
+            protocol_columns = ['packet_number', 'nested_protocol', 'message_type', 'channel_type', 'direction']
+
+            # Sort field names for consistent column ordering, excluding protocol columns
+            other_fields = [f for f in self._nas_fields_only if f not in protocol_columns]
+            sorted_fields = protocol_columns + sorted(other_fields)
+
+            self.logger.info(f"Exporting {len(self._nas_packets_only)} NAS packets to CSV")
+
+            with open(csv_output_path, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.DictWriter(csvfile, fieldnames=sorted_fields, restval='-1')
+
+                # Write header
+                writer.writeheader()
+
+                # Write packet data
+                for packet_data in self._nas_packets_only:
+                    # Create row with -1 for missing fields
+                    row = {}
+                    for field in sorted_fields:
+                        if field in protocol_columns:
+                            # Use actual values for protocol columns, or 'unknown' if missing
+                            row[field] = packet_data.get(field, 'unknown')
+                        else:
+                            # Use -1 for missing data fields
+                            row[field] = packet_data.get(field, '-1')
+                    writer.writerow(row)
+
+            self.logger.info(f"Successfully exported NAS packets to {csv_output_path}")
+
+        except Exception as e:
+            self.logger.error(f"Error exporting NAS packets to CSV: {e}")
 
     def _reset_csv_data(self):
         """Reset CSV data for new processing session"""
         self._rrc_packets_data = []
-        self._nas_packets_data = []
         self._all_rrc_fields = set()
-        self._all_nas_fields = set()
+
+        # Reset separate RRC/NAS data structures
+        self._rrc_packets_only = []
+        self._nas_packets_only = []
+        self._rrc_fields_only = set()
+        self._nas_fields_only = set()
+
         self._packet_count = 0
 
-    def _find_matching_field_definition(self, field_name, protocol_fields, protocol_name):
-        """Find matching field definition in dissector fields"""
-        try:
-            # Early return if no protocol fields available
-            if not protocol_fields:
-                return None
-                
-            # Direct match with hf_ prefix
-            hf_name = f"hf_{protocol_name}_{field_name}"
-            if hf_name in protocol_fields:
-                return hf_name
-            
-            # Try variations for different naming conventions
-            variations = [
-                f"hf_{protocol_name.replace('_', '-')}_{field_name}",
-                f"hf_{protocol_name}_{field_name.replace('-', '_')}",
-                f"hf_{protocol_name.replace('_', '')}_{field_name}",
-                # Handle gsm_a variations
-                f"hf_gsm_a_{field_name}" if protocol_name.startswith('gsm_a_') else None,
-                f"hf_gsm_a_{protocol_name.split('_')[-1]}_{field_name}" if protocol_name.startswith('gsm_a_') else None,
-                # Handle gsmtap variations
-                f"hf_gsmtap_{field_name}" if protocol_name == 'gsmtap' else None,
-            ]
-            
-            for variation in variations:
-                if variation and variation in protocol_fields:
-                    return variation
-            
-            # Limit the search to prevent infinite loops - only check first 100 fields
-            field_count = 0
-            max_fields_to_check = 100
-            
-            # Search by filter name match with enhanced patterns
-            field_name_normalized = field_name.replace('_', '-').replace('-', '.')
-            
-            for hf_name, field_info in protocol_fields.items():
-                field_count += 1
-                if field_count > max_fields_to_check:
-                    break
-                    
-                try:
-                    # Direct filter name match
-                    if field_name_normalized in field_info.get('filter_name', ''):
-                        return hf_name
-                    if field_name in field_info.get('filter_name', ''):
-                        return hf_name
-                    # Display name match
-                    if field_info.get('display_name', '').lower() == field_name.lower():
-                        return hf_name
-                    # Partial matches for complex field names
-                    if field_name.lower() in field_info.get('display_name', '').lower():
-                        return hf_name
-                    # Handle gsm_a specific patterns
-                    if protocol_name.startswith('gsm_a_') and field_name in hf_name:
-                        return hf_name
-                except (KeyError, AttributeError, TypeError):
-                    continue  # Skip problematic field info
-            
-            return None
-            
-        except Exception as e:
-            self.logger.debug(f"Error in field matching for {field_name}: {e}")
-            return None
-
-    def process_qmdl_to_pdml(self, packet_processor_func, pcap_output_path=None, csv_output_path=None):
-        """
-        Process QMDL packets and convert to PDML XML using permanent PCAP with PyShark
-
-        Args:
-            packet_processor_func: Function that writes packets using this DataWriter
-            pcap_output_path (str): Optional permanent PCAP output file path
-            csv_output_path (str): Optional CSV output file path for RRC data
-
-        Returns:
-            str: PDML XML data from PyShark dissection
-        """
-        pcap_file_path = None
-        try:
-            # Reset CSV data for new processing session
-            self._reset_csv_data()
-            
-            # Create PCAP file path
-            if pcap_output_path:
-                # Use provided permanent path
-                pcap_file_path = pcap_output_path
-                # Ensure directory exists
-                pcap_dir = os.path.dirname(pcap_file_path)
-                if pcap_dir and not os.path.exists(pcap_dir):
-                    os.makedirs(pcap_dir)
-            else:
-                # Create temporary PCAP file as fallback
-                temp_dir = tempfile.gettempdir()
-                temp_pcap = tempfile.NamedTemporaryFile(
-                    delete=False,
-                    suffix='.pcap',
-                    prefix='qmdl_temp_',
-                    dir=temp_dir
-                )
-                pcap_file_path = temp_pcap.name
-                temp_pcap.close()
-
-            # Initialize PCAP file
-            self._init_pcap_file(pcap_file_path)
-
-            # Call packet processor function
-            if packet_processor_func:
-                packet_processor_func(self)
-
-            # Close PCAP file
-            self._close_pcap_file()
-
-            # Convert PCAP to PDML XML using PyShark
-            pdml_data = self._pcap_to_pdml_with_pyshark(pcap_file_path)
-            
-            # Export RRC and NAS data to separate CSV files if requested
-            if csv_output_path and (self._rrc_packets_data or self._nas_packets_data):
-                self._export_separate_rrc_nas_csv(csv_output_path)
-
-            return pdml_data
-
-        except Exception as e:
-            error_msg = f"Error processing QMDL to PDML: {e}"
-            self.logger.error(error_msg)
-            return f'<pdml><error>{error_msg}</error></pdml>'
-
-        finally:
-            # Only clean up if it's a temporary file (no pcap_output_path provided)
-            if not pcap_output_path and pcap_file_path and os.path.exists(pcap_file_path):
-                try:
-                    os.unlink(pcap_file_path)
-                    self.logger.debug(f"Cleaned up temporary PCAP file: {pcap_file_path}")
-                except Exception as e:
-                    self.logger.warning(f"Failed to clean up temporary file {pcap_file_path}: {e}")
-            elif pcap_output_path and pcap_file_path:
-                self.logger.info(f"Permanent PCAP file saved: {pcap_file_path}")
+    def log_layer_usage_statistics(self):
+        """Log basic statistics about processing"""
+        self.logger.info(f"Processed {self._packet_count} packets")
 
     def _init_pcap_file(self, filename):
         """Initialize PCAP file with global header"""
@@ -699,226 +840,13 @@ class DataWriter:
         """Write user plane packet"""
         self.write_pkt(sock_content, self.port_up, radio_id, ts)
 
-    def _pcap_to_pdml_with_pyshark(self, pcap_file_path):
-        """Convert PCAP file to PDML XML using PyShark"""
-        try:
-            # Open PCAP with PyShark
-            cap = pyshark.FileCapture(pcap_file_path, include_raw=False, use_json=False)
-            
-            # Create PDML root element
-            pdml = ET.Element("pdml")
-            pdml.set("version", "0")
-            pdml.set("creator", "pyshark-datawriter/1.0")
-            pdml.set("time", datetime.datetime.now().strftime("%a %b %d %H:%M:%S %Y"))
-            pdml.set("capture_file", os.path.basename(pcap_file_path))
-            
-            packet_count = 0
-            max_packets = 5000  # Limit to prevent infinite processing
-            
-            # Process each packet
-            for packet in cap:
-                packet_count += 1
-                
-                # Limit packet processing to prevent hanging
-                if packet_count > max_packets:
-                    self.logger.warning(f"Reached packet limit ({max_packets}), stopping processing")
-                    break
-                
-                packet_elem = ET.SubElement(pdml, "packet")
-                
-                # Add packet timestamp and frame info
-                self._add_packet_metadata(packet_elem, packet, packet_count)
-                
-                # Process all protocol layers in the packet
-                self._process_packet_layers(packet_elem, packet)
-                
-                # Extract RRC data for CSV export
-                self._extract_rrc_data_for_csv(packet, packet_count)
-            
-            cap.close()
-            
-            if packet_count == 0:
-                return '<pdml><error>No packets found in PCAP</error></pdml>'
-            
-            # Convert XML tree to string
-            xml_str = self._xml_to_string_with_header(pdml)
-            
-            self.logger.info(f"Processed {packet_count} packets with PyShark")
-            return xml_str
-
-        except Exception as e:
-            error_msg = f"PyShark processing error: {e}"
-            self.logger.error(error_msg)
-            return f'<pdml><error>{error_msg}</error></pdml>'
-
-    def _add_packet_metadata(self, packet_elem, packet, packet_num):
-        """Add packet metadata and frame information"""
-        # Get packet size
-        packet_size = int(packet.length) if hasattr(packet, 'length') else len(packet.get_raw_packet())
-        
-        # Add geninfo protocol
-        geninfo = ET.SubElement(packet_elem, "proto")
-        geninfo.set("name", "geninfo")
-        geninfo.set("pos", "0")
-        geninfo.set("showname", "General information")
-        geninfo.set("size", str(packet_size))
-        
-        # Packet number
-        num_field = ET.SubElement(geninfo, "field")
-        num_field.set("name", "num")
-        num_field.set("pos", "0")
-        num_field.set("show", str(packet_num))
-        num_field.set("showname", "Number")
-        num_field.set("value", str(packet_num))
-        num_field.set("size", str(packet_size))
-        
-        # Frame length
-        len_field = ET.SubElement(geninfo, "field")
-        len_field.set("name", "len")
-        len_field.set("pos", "0")
-        len_field.set("show", str(packet_size))
-        len_field.set("showname", "Frame Length")
-        len_field.set("value", hex(packet_size)[2:])
-        len_field.set("size", str(packet_size))
-        
-        # Timestamp
-        if hasattr(packet, 'sniff_time'):
-            timestamp = packet.sniff_time
-            timestamp_str = timestamp.strftime("%b %d, %Y %H:%M:%S.%f000")
-            ts_field = ET.SubElement(geninfo, "field")
-            ts_field.set("name", "timestamp")
-            ts_field.set("pos", "0")
-            ts_field.set("show", timestamp_str)
-            ts_field.set("showname", "Captured Time")
-            ts_field.set("value", f"{timestamp.timestamp():.9f}")
-            ts_field.set("size", str(packet_size))
-
-    def _process_packet_layers(self, packet_elem, packet):
-        """Process all protocol layers in the packet"""
-        try:
-            # Get all layers
-            for layer in packet.layers:
-                layer_name = layer.layer_name.lower()
-                
-                # Create protocol element
-                proto_elem = ET.SubElement(packet_elem, "proto")
-                proto_elem.set("name", layer_name)
-                proto_elem.set("showname", f"{layer_name.upper()} Layer")
-                proto_elem.set("size", "0")  # PyShark doesn't always provide size
-                proto_elem.set("pos", "0")   # PyShark doesn't provide position info
-                
-                # Add fields from this layer
-                self._add_layer_fields(proto_elem, layer, layer_name)
-                
-                # Special handling for specific protocols using dissector definitions
-                if layer_name in self.protocol_dissectors:
-                    self.protocol_dissectors[layer_name](proto_elem, layer)
-                    
-        except Exception as e:
-            # Add error information if layer processing fails
-            error_proto = ET.SubElement(packet_elem, "proto")
-            error_proto.set("name", "processing_error")
-            error_field = ET.SubElement(error_proto, "field")
-            error_field.set("name", "error")
-            error_field.set("show", f"Layer processing error: {e}")
-
-    def _add_layer_fields(self, proto_elem, layer, layer_name):
-        """Add fields from a protocol layer"""
-        try:
-            field_names = layer.field_names if hasattr(layer, 'field_names') else []
-            
-            for field_name in field_names:
-                try:
-                    field_value = getattr(layer, field_name, None)
-                    
-                    # Skip None values that cause serialization errors
-                    if field_value is not None:
-                        field_elem = ET.SubElement(proto_elem, "field")
-                        field_elem.set("name", f"{layer_name}.{field_name}")
-                        field_elem.set("showname", f"{field_name}: {field_value}")
-                        field_elem.set("show", str(field_value))
-                        field_elem.set("value", str(field_value))
-                        field_elem.set("size", "0")
-                        field_elem.set("pos", "0")
-                            
-                except Exception as e:
-                    continue
-                        
-        except Exception as e:
-            error_field = ET.SubElement(proto_elem, "field")
-            error_field.set("name", "field_error")
-            error_field.set("show", f"Field processing error: {e}")
-
-    def _add_specialized_protocol_fields(self, proto_elem, layer, layer_name):
-        """Add comprehensive specialized fields for all supported cellular protocols"""
-        try:
-            # Use the enhanced dissector mappings
-            if layer_name in self.protocol_dissectors:
-                self.protocol_dissectors[layer_name](proto_elem, layer)
-            else:
-                # Fallback for unknown protocols - extract all available fields
-                self._extract_all_available_fields(proto_elem, layer, layer_name)
-                
-        except Exception as e:
-            # Add detailed error information for debugging
-            error_field = ET.SubElement(proto_elem, "field")
-            error_field.set("name", f"{layer_name}_specialized_error")
-            error_field.set("show", f"Specialized processing error: {e}")
-            error_field.set("showname", f"Error in {layer_name} processing: {str(e)}")
-            error_field.set("size", "0")
-            error_field.set("pos", "0")
-
-    def _format_field_value(self, value):
-        """Format field value for XML output"""
-        try:
-            if isinstance(value, bytes):
-                return value.hex()
-            elif isinstance(value, (int, float)):
-                return str(value)
-            elif isinstance(value, bool):
-                return "1" if value else "0"
-            else:
-                return str(value)
-        except Exception:
-            return str(value)
-
-    def _add_error_field(self, parent_elem, error_name, error_message):
-        """Add an error field to the parent element"""
-        try:
-            error_field = ET.SubElement(parent_elem, "field")
-            error_field.set("name", error_name)
-            error_field.set("show", error_message)
-            error_field.set("showname", f"Error: {error_message}")
-            error_field.set("size", "0")
-            error_field.set("pos", "0")
-        except Exception:
-            pass  # Silently handle error field creation errors
-
-    def _xml_to_string_with_header(self, root_element):
-        """Convert XML element to string with proper PDML header"""
-        # Create XML string with header
-        xml_str = '<?xml version="1.0" encoding="utf-8"?>\n'
-        xml_str += '<?xml-stylesheet type="text/xsl" href="pdml2html.xsl"?>\n'
-        
-        # Convert element to string
-        rough_string = ET.tostring(root_element, encoding='unicode')
-        xml_str += rough_string
-        
-        return xml_str
-
     def is_pyshark_available(self):
         """Check if PyShark is available"""
         return PYSHARK_AVAILABLE
-
-    def get_tshark_version_info(self):
-        """Get version information (PyShark equivalent)"""
-        try:
-            import pyshark
-            return f"PyShark {pyshark.__version__} with Wireshark backend"
-        except:
-            return "PyShark not available"
 
 # Backward compatibility
 class PySharkDataWriter(DataWriter):
     """Alias for backward compatibility"""
     pass
+
+

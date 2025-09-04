@@ -56,7 +56,7 @@ python3 qmdl_reader.py diag_log.qmdl -c output.csv
 
 ## Data Flow
 
-### QMDL ➜ PCAP, XML (PDML), and separate RRC/NAS CSV
+### QMDL ➜ PCAP and separate RRC/NAS CSV
 
 ```mermaid
 graph TD
@@ -65,10 +65,9 @@ graph TD
   C --> D["DataWriter.write_* ➜ PCAP"]
   D --> E["PCAP file (.pcap)"]
   E --> F["PyShark (tshark)"]
-  F --> G["PDML XML (.xml)"]
-  F --> H["Layer iteration & field categorization"]
-  H --> I["RRC CSV (<base>_rrc.csv)"]
-  H --> J["NAS CSV (<base>_nas.csv, headers lte./nr.)"]
+  F --> G["Layer iteration & field categorization"]
+  G --> H["RRC CSV (<base>_rrc.csv)"]
+  G --> I["NAS CSV (<base>_nas.csv, headers lte./nr.)"]
 ```
 
 Notes:
@@ -76,16 +75,16 @@ Notes:
 - The `-c` flag is a base path; CSVs are written as `<base>_rrc.csv` and `<base>_nas.csv`.
 - NAS CSV headers normalize RAT prefixes: `lte_rrc.*`/`lte-rrc.*` ➜ `lte.*`, `nr_rrc.*`/`nr-rrc.*` ➜ `nr.*`.
 - When `-p` is supplied, the PCAP is written as a permanent output.
+- **PDML XML output has been removed** - only PCAP and CSV outputs are supported.
 
-### PCAP ➜ XML (PDML) and separate RRC/NAS CSV
+### PCAP ➜ separate RRC/NAS CSV
 
 ```mermaid
 graph TD
   A["PCAP file (.pcap)"] --> B["PyShark (tshark) via DataWriter"]
-  B --> C["PDML XML (.xml)"]
-  B --> D["Layer iteration & field categorization"]
-  D --> E["RRC CSV (<base>_rrc.csv)"]
-  D --> F["NAS CSV (<base>_nas.csv, headers lte./nr.)"]
+  B --> C["Layer iteration & field categorization"]
+  C --> D["RRC CSV (<base>_rrc.csv)"]
+  C --> E["NAS CSV (<base>_nas.csv, headers lte./nr.)"]
 ```
 
 ## Usage Examples
