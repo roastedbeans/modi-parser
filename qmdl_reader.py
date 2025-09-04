@@ -97,10 +97,28 @@ class QmdlReader:
 
             # Process QMDL and create PCAP
             success = self._process_qmdl_to_pcap(packet_processor, pcap_output_path)
-            
-            if success and output_csv and self.data_writer._rrc_packets_data:
+
+            # If CSV output is requested and PCAP was created successfully, process the PCAP file for CSV extraction
+            if success and output_csv and pcap_output_path and os.path.exists(pcap_output_path):
+                # Process the created PCAP file to extract CSV data
+                csv_success = self._process_pcap_file(pcap_output_path, output_csv, None)
+                if csv_success:
+                    print(f"RRC CSV output written to: {output_csv}")
+                    # Generate separate RRC and NAS CSV files
+                    self._export_separate_rrc_nas_csvs(output_csv)
+                else:
+                    print(f"Failed to extract CSV data from PCAP file")
+            elif success and output_csv and self.data_writer._rrc_packets_data:
+                # Export original CSV
                 self.data_writer._export_rrc_to_csv(output_csv)
                 print(f"RRC CSV output written to: {output_csv}")
+
+                # Generate separate RRC and NAS CSV files
+                self._export_separate_rrc_nas_csvs(output_csv)
+            elif success and output_csv:
+                print(f"Processing succeeded but no RRC packet data collected")
+            else:
+                print(f"CSV export conditions not met")
             
             # Inform about PCAP output
             if pcap_output_path:
@@ -288,6 +306,9 @@ class QmdlReader:
                 if self.data_writer._rrc_packets_data:
                     self.data_writer._export_rrc_to_csv(output_csv)
                     print(f"RRC CSV output written to: {output_csv}")
+
+                    # Generate separate RRC and NAS CSV files
+                    self._export_separate_rrc_nas_csvs(output_csv)
                 else:
                     print(f"No RRC data found for CSV export to: {output_csv}")
             
@@ -409,7 +430,34 @@ class QmdlReader:
                 return json.dumps({'error': 'File too small or could not be read'})
         except Exception as e:
             return json.dumps({'error': str(e)})
-    
+
+    def _export_separate_rrc_nas_csvs(self, original_csv_path):
+        """Export separate RRC and NAS CSV files"""
+        try:
+            import os
+
+            # Generate file paths for RRC and NAS CSV files
+            base_path = os.path.splitext(original_csv_path)[0]
+            rrc_csv_path = f"{base_path}_rrc.csv"
+            nas_csv_path = f"{base_path}_nas.csv"
+
+            # Export RRC packets if any exist
+            if hasattr(self.data_writer, '_rrc_packets_only') and self.data_writer._rrc_packets_only:
+                self.data_writer._export_rrc_only_to_csv(rrc_csv_path)
+                print(f"RRC-specific CSV output written to: {rrc_csv_path}")
+            else:
+                print("No RRC packets found for separate RRC CSV export")
+
+            # Export NAS packets if any exist
+            if hasattr(self.data_writer, '_nas_packets_only') and self.data_writer._nas_packets_only:
+                self.data_writer._export_nas_only_to_csv(nas_csv_path)
+                print(f"NAS-specific CSV output written to: {nas_csv_path}")
+            else:
+                print("No NAS packets found for separate NAS CSV export")
+
+        except Exception as e:
+            print(f"Error exporting separate RRC/NAS CSV files: {e}")
+
     def process_qmdl_files_from_java_json(self, files_json):
         """Process QMDL files provided by Java (since Java has root access) - JSON version"""
         try:
