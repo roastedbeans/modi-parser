@@ -546,23 +546,24 @@ class DataWriter:
 
                 # PyShark field objects have display information from the dissector
                 # Priority order: showname (most complete) > show > display
-                if hasattr(field_obj, 'showname') and field_obj.showname:
-                    return str(field_obj.showname)
-                elif hasattr(field_obj, 'show') and field_obj.show:
-                    return str(field_obj.show)
-                elif hasattr(field_obj, 'display') and field_obj.display:
-                    return str(field_obj.display)
+                if raw_value.lower().startswith('0x'):
+                    if hasattr(field_obj, 'showname') and field_obj.showname:
+                        return str(field_obj.showname)
+                # elif hasattr(field_obj, 'show') and field_obj.show:
+                #     return str(field_obj.show)
+                # elif hasattr(field_obj, 'display') and field_obj.display:
+                #     return str(field_obj.display)
 
                 # Some PyShark fields have additional display attributes
-                if hasattr(field_obj, 'display_name') and field_obj.display_name:
-                    return str(field_obj.display_name)
+                # if hasattr(field_obj, 'display_name') and field_obj.display_name:
+                #     return str(field_obj.display_name)
 
                 # Check if the field has a decoded value that differs from raw
-                if hasattr(field_obj, 'value'):
-                    field_value = field_obj.value
-                    # Only return the value if it's different from raw (meaning it was decoded)
-                    if str(field_value) != str(raw_value):
-                        return str(field_value)
+                # if hasattr(field_obj, 'value'):
+                #     field_value = field_obj.value
+                #     # Only return the value if it's different from raw (meaning it was decoded)
+                #     if str(field_value) != str(raw_value):
+                #         return str(field_value)
 
             # Fallback to raw value if no display information available
             return str(raw_value)
@@ -577,23 +578,26 @@ class DataWriter:
                 # Process all available fields for comprehensive extraction
                 field_names = list(layer.field_names)
 
-                
+
                 for field_name in field_names:
                     try:
                         raw_field_value = getattr(layer, field_name, None)
                         if raw_field_value is not None and raw_field_value != '':
-                            # Filter UMTS RRC fields to only include specified ones
-                            if layer_name == 'umts_rrc' and normalized_field_name not in self._umts_rrc_fields:
-                                continue
-
                             # Create CSV field name using layer name and field name
                             # Normalize both layer name and field name to use underscores for consistent syntax
                             normalized_layer_name = layer_name.replace('-', '_').replace('.', '_')
                             normalized_field_name = field_name.replace('-', '_').replace('.', '_')
                             csv_field_name = f"{normalized_layer_name}.{normalized_field_name}"
 
+                            # Filter UMTS RRC fields to only include specified ones
+                            if layer_name == 'umts_rrc' and normalized_field_name not in self._umts_rrc_fields:
+                                continue
+
                             # Try to get the display value (readable text) instead of raw value
                             field_value = self._get_display_value_from_field(layer, field_name, raw_field_value)
+
+                            # Store both raw and formatted values for separated vs combined exports
+                            raw_field_value_str = str(raw_field_value) if raw_field_value is not None else ''
 
                             # Convert field value to string and handle special cases
                             if isinstance(field_value, (list, tuple)):
@@ -626,13 +630,16 @@ class DataWriter:
                                 not 'extraneous data' in field_value.lower() and
                                 not 'later version spec' in field_value.lower()):
 
+                                # Store formatted value (with showname) for combined export
                                 packet_data[csv_field_name] = field_value
+                                # Store raw value for separated exports
+                                packet_data[f"{csv_field_name}_raw"] = raw_field_value_str
                                 self._all_rrc_fields.add(csv_field_name)
-                            
+
                     except Exception as e:
                         self.logger.debug(f"Error processing field {field_name}: {e}")
                         continue
-                        
+
         except Exception as e:
             self.logger.debug(f"Error extracting layer fields for CSV: {e}")
 
@@ -710,8 +717,13 @@ class DataWriter:
                             # Use actual values for protocol columns, or 'unknown' if missing
                             row[field] = packet_data.get(field, 'unknown')
                         else:
-                            # Use -1 for missing data fields
-                            row[field] = packet_data.get(field, '-1')
+                            # For separated RRC export, use raw values instead of formatted values
+                            raw_field_key = f"{field}_raw"
+                            if raw_field_key in packet_data:
+                                row[field] = packet_data[raw_field_key]
+                            else:
+                                # Fallback to -1 for missing data fields
+                                row[field] = packet_data.get(field, '-1')
                     writer.writerow(row)
 
             self.logger.info(f"Successfully exported RRC packets to {csv_output_path}")
@@ -750,8 +762,13 @@ class DataWriter:
                             # Use actual values for protocol columns, or 'unknown' if missing
                             row[field] = packet_data.get(field, 'unknown')
                         else:
-                            # Use -1 for missing data fields
-                            row[field] = packet_data.get(field, '-1')
+                            # For separated NAS export, use raw values instead of formatted values
+                            raw_field_key = f"{field}_raw"
+                            if raw_field_key in packet_data:
+                                row[field] = packet_data[raw_field_key]
+                            else:
+                                # Fallback to -1 for missing data fields
+                                row[field] = packet_data.get(field, '-1')
                     writer.writerow(row)
 
             self.logger.info(f"Successfully exported NAS packets to {csv_output_path}")
