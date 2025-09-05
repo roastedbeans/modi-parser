@@ -483,7 +483,7 @@ class DataWriter:
         field_normalized = field_name.lower().replace('-', '_').replace('.', '_')
 
         # GSMTAP fields belong to both (metadata)
-        if field_lower.startswith('gsmtap.'):
+        if field_lower.startswith('gsmtap'):
             return 'both'
 
         # Protocol identification fields belong to both
@@ -549,22 +549,7 @@ class DataWriter:
                 if raw_value.lower().startswith('0x'):
                     if hasattr(field_obj, 'showname') and field_obj.showname:
                         return str(field_obj.showname)
-                # elif hasattr(field_obj, 'show') and field_obj.show:
-                #     return str(field_obj.show)
-                # elif hasattr(field_obj, 'display') and field_obj.display:
-                #     return str(field_obj.display)
-
-                # Some PyShark fields have additional display attributes
-                # if hasattr(field_obj, 'display_name') and field_obj.display_name:
-                #     return str(field_obj.display_name)
-
-                # Check if the field has a decoded value that differs from raw
-                # if hasattr(field_obj, 'value'):
-                #     field_value = field_obj.value
-                #     # Only return the value if it's different from raw (meaning it was decoded)
-                #     if str(field_value) != str(raw_value):
-                #         return str(field_value)
-
+              
             # Fallback to raw value if no display information available
             return str(raw_value)
         except Exception as e:
@@ -587,7 +572,7 @@ class DataWriter:
                             # Normalize both layer name and field name to use underscores for consistent syntax
                             normalized_layer_name = layer_name.replace('-', '_').replace('.', '_')
                             normalized_field_name = field_name.replace('-', '_').replace('.', '_')
-                            csv_field_name = f"{normalized_layer_name}.{normalized_field_name}"
+                            csv_field_name = "_".join(filter(None, [normalized_layer_name, normalized_field_name]))
 
                             # Filter UMTS RRC fields to only include specified ones
                             if layer_name == 'umts_rrc' and normalized_field_name not in self._umts_rrc_fields:
@@ -596,44 +581,35 @@ class DataWriter:
                             # Try to get the display value (readable text) instead of raw value
                             field_value = self._get_display_value_from_field(layer, field_name, raw_field_value)
 
-                            # Store both raw and formatted values for separated vs combined exports
+                            # Convert raw field value to string for storage
                             raw_field_value_str = str(raw_field_value) if raw_field_value is not None else ''
 
-                            # Convert field value to string and handle special cases
-                            if isinstance(field_value, (list, tuple)):
-                                field_value = ','.join(str(v) for v in field_value)
-                            elif isinstance(field_value, dict):
-                                field_value = str(field_value)
-                            else:
-                                field_value = str(field_value)
-
-                            # Only add meaningful values (not empty, None, or -1)
+                            # Only add meaningful raw values (not empty, None, or -1)
                             # Also filter out Wireshark expert info messages and other noise
                             # Special handling for GSMTAP fields where '0' is a valid value
                             is_valid_value = True
-                            if field_value in ['None', '']:
+                            if raw_field_value_str in ['None', '']:
                                 is_valid_value = False
-                            elif field_value == '-1' and layer_name != 'gsmtap':
+                            elif raw_field_value_str == '-1' and layer_name != 'gsmtap':
                                 # -1 might be valid for GSMTAP but not for other protocols
                                 is_valid_value = False
-                            elif field_value == '0':
+                            elif raw_field_value_str == '0':
                                 # '0' is invalid for most protocols but valid for GSMTAP
                                 if layer_name != 'gsmtap':
                                     is_valid_value = False
 
                             if (is_valid_value and
-                                len(field_value.strip()) > 0 and
-                                not field_value.startswith('Expert Info') and
-                                not field_value.startswith('All ') and
-                                not field_value.startswith('dissector bug') and
-                                not field_value.startswith('report to wireshark.org') and
-                                not 'extraneous data' in field_value.lower() and
-                                not 'later version spec' in field_value.lower()):
+                                len(raw_field_value_str.strip()) > 0 and
+                                not raw_field_value_str.startswith('Expert Info') and
+                                not raw_field_value_str.startswith('All ') and
+                                not raw_field_value_str.startswith('dissector bug') and
+                                not raw_field_value_str.startswith('report to wireshark.org') and
+                                not 'extraneous data' in raw_field_value_str.lower() and
+                                not 'later version spec' in raw_field_value_str.lower()):
 
-                                # Store formatted value (with showname) for combined export
-                                packet_data[csv_field_name] = field_value
-                                # Store raw value for separated exports
-                                packet_data[f"{csv_field_name}_raw"] = raw_field_value_str
+                                # Store raw value
+                                packet_data[csv_field_name] = raw_field_value_str
+
                                 self._all_rrc_fields.add(csv_field_name)
 
                     except Exception as e:
@@ -674,7 +650,7 @@ class DataWriter:
                             # Use actual values for protocol columns, or 'unknown' if missing
                             row[field] = packet_data.get(field, 'unknown')
                         else:
-                            # Use -1 for missing data fields
+                            # Use raw value
                             row[field] = packet_data.get(field, '-1')
                     writer.writerow(row)
             
@@ -686,6 +662,47 @@ class DataWriter:
         except Exception as e:
             self.logger.error(f"Error exporting protocol data to CSV: {e}")
 
+    def _should_normalize_field_value(self, field_value):
+        """Determine if a field value should be normalized based on its content"""
+        if field_value == '-1' or field_value == '':
+            return False  # Don't normalize missing values
+
+        value_str = str(field_value).strip()
+
+        # Check for usable data patterns (hexadecimal, decimal, etc.)
+        import re
+
+        # Hexadecimal patterns (0x..., 0X..., or just hex digits)
+        if re.match(r'^0[xX][0-9a-fA-F]+$', value_str):
+            return False  # Keep hex values as-is
+
+        # Decimal numbers (integers)
+        if re.match(r'^-?\d+$', value_str):
+            return False  # Keep decimal values as-is
+
+        # Hex codes without 0x prefix (pure hex digits)
+        if re.match(r'^[0-9a-fA-F]+$', value_str):
+            return False  # Keep hex codes as-is
+
+        # Boolean values - convert to 1/0 but don't consider as message
+        if value_str.lower() in ['true', 'false']:
+            return False  # Handle separately for boolean conversion
+
+        # Floating point numbers
+        if re.match(r'^-?\d+\.\d+$', value_str):
+            return False  # Keep float values as-is
+
+        # IP addresses
+        if re.match(r'^\d+\.\d+\.\d+\.\d+$', value_str):
+            return False  # Keep IP addresses as-is
+
+        # MAC addresses
+        if re.match(r'^([0-9a-fA-F]{2}[:-]){5}[0-9a-fA-F]{2}$', value_str):
+            return False  # Keep MAC addresses as-is
+
+        # Any other value is considered a message and should be normalized to '1'
+        return True
+
     def _export_rrc_only_to_csv(self, csv_output_path):
         """Export only RRC packets to CSV file"""
         try:
@@ -693,11 +710,11 @@ class DataWriter:
                 self.logger.warning("No RRC packets to export to CSV")
                 return
 
-            # Add protocol identification columns at the beginning
-            protocol_columns = ['packet_number', 'nested_protocol', 'message_type', 'channel_type', 'direction']
+            # For separated RRC export, only include packet_number (exclude other protocol columns)
+            protocol_columns = ['packet_number']
 
             # Sort field names for consistent column ordering, excluding protocol columns
-            other_fields = [f for f in self._rrc_fields_only if f not in protocol_columns]
+            other_fields = [f for f in self._rrc_fields_only if f not in ['packet_number', 'nested_protocol', 'message_type', 'channel_type', 'direction']]
             sorted_fields = protocol_columns + sorted(other_fields)
 
             self.logger.info(f"Exporting {len(self._rrc_packets_only)} RRC packets to CSV")
@@ -713,17 +730,23 @@ class DataWriter:
                     # Create row with -1 for missing fields
                     row = {}
                     for field in sorted_fields:
-                        if field in protocol_columns:
-                            # Use actual values for protocol columns, or 'unknown' if missing
+                        if field == 'packet_number':
+                            # Use actual values for packet_number, or 'unknown' if missing
                             row[field] = packet_data.get(field, 'unknown')
                         else:
-                            # For separated RRC export, use raw values instead of formatted values
-                            raw_field_key = f"{field}_raw"
-                            if raw_field_key in packet_data:
-                                row[field] = packet_data[raw_field_key]
+                            # For separated RRC export, normalize based on value content
+                            raw_value = packet_data.get(field, '-1')
+
+                            # Handle boolean values
+                            if str(raw_value).lower() == 'true':
+                                row[field] = '1'
+                            elif str(raw_value).lower() == 'false':
+                                row[field] = '0'
+                            # Check if value should be normalized (is a message)
+                            elif self._should_normalize_field_value(raw_value):
+                                row[field] = '1'  # Message content -> '1'
                             else:
-                                # Fallback to -1 for missing data fields
-                                row[field] = packet_data.get(field, '-1')
+                                row[field] = raw_value  # Keep usable data as-is
                     writer.writerow(row)
 
             self.logger.info(f"Successfully exported RRC packets to {csv_output_path}")
@@ -738,11 +761,11 @@ class DataWriter:
                 self.logger.warning("No NAS packets to export to CSV")
                 return
 
-            # Add protocol identification columns at the beginning
-            protocol_columns = ['packet_number', 'nested_protocol', 'message_type', 'channel_type', 'direction']
+            # For separated NAS export, only include packet_number (exclude other protocol columns)
+            protocol_columns = ['packet_number']
 
             # Sort field names for consistent column ordering, excluding protocol columns
-            other_fields = [f for f in self._nas_fields_only if f not in protocol_columns]
+            other_fields = [f for f in self._nas_fields_only if f not in ['packet_number', 'nested_protocol', 'message_type', 'channel_type', 'direction']]
             sorted_fields = protocol_columns + sorted(other_fields)
 
             self.logger.info(f"Exporting {len(self._nas_packets_only)} NAS packets to CSV")
@@ -758,17 +781,23 @@ class DataWriter:
                     # Create row with -1 for missing fields
                     row = {}
                     for field in sorted_fields:
-                        if field in protocol_columns:
-                            # Use actual values for protocol columns, or 'unknown' if missing
+                        if field == 'packet_number':
+                            # Use actual values for packet_number, or 'unknown' if missing
                             row[field] = packet_data.get(field, 'unknown')
                         else:
-                            # For separated NAS export, use raw values instead of formatted values
-                            raw_field_key = f"{field}_raw"
-                            if raw_field_key in packet_data:
-                                row[field] = packet_data[raw_field_key]
+                            # For separated NAS export, normalize based on value content
+                            raw_value = packet_data.get(field, '-1')
+
+                            # Handle boolean values
+                            if str(raw_value).lower() == 'true':
+                                row[field] = '1'
+                            elif str(raw_value).lower() == 'false':
+                                row[field] = '0'
+                            # Check if value should be normalized (is a message)
+                            elif self._should_normalize_field_value(raw_value):
+                                row[field] = '1'  # Message content -> '1'
                             else:
-                                # Fallback to -1 for missing data fields
-                                row[field] = packet_data.get(field, '-1')
+                                row[field] = raw_value  # Keep usable data as-is
                     writer.writerow(row)
 
             self.logger.info(f"Successfully exported NAS packets to {csv_output_path}")
