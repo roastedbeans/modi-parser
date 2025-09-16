@@ -1,9 +1,8 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.8
 # coding: utf8
 
 import xml.etree.ElementTree as ET
 import csv
-import os
 import re
 from pathlib import Path
 
@@ -386,13 +385,17 @@ class PdmlToTableConverter:
 
         # Generate NAS CSV if there are NAS packets
         if self.nas_packets:
-            nas_filename = str(Path(base_filename).with_stem(Path(base_filename).stem + '_nas'))
+            # Python 3.8 compatible: manually construct path with suffix
+            base_path = Path(base_filename)
+            nas_filename = str(base_path.parent / (base_path.stem + '_nas' + base_path.suffix))
             if not self.generate_csv(nas_filename, self.nas_packets, self.nas_fields):
                 success = False
 
         # Generate RRC CSV if there are RRC packets
         if self.rrc_packets:
-            rrc_filename = str(Path(base_filename).with_stem(Path(base_filename).stem + '_rrc'))
+            # Python 3.8 compatible: manually construct path with suffix
+            base_path = Path(base_filename)
+            rrc_filename = str(base_path.parent / (base_path.stem + '_rrc' + base_path.suffix))
             if not self.generate_csv(rrc_filename, self.rrc_packets, self.rrc_fields):
                 success = False
 

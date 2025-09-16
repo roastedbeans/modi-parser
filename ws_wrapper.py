@@ -1,11 +1,12 @@
-#!/usr/bin/env python3
+#!/usr/bin/env python3.8
 """
 ws_dissector Python Wrapper
 
 A simplified interface for using ws_dissector with:
-1. Packet dissection from JSON input files
-2. XML output generation
-3. Basic error handling and logging
+1. Automatic platform detection (Android vs Desktop)
+2. Packet dissection from JSON input files
+3. XML output generation to output/ folder
+4. Basic error handling and logging
 """
 
 import struct
@@ -14,6 +15,7 @@ import xml.etree.ElementTree as ET
 from xml.dom import minidom
 import sys
 import os
+import platform
 import argparse
 import logging
 from datetime import datetime
@@ -21,25 +23,51 @@ import time
 
 
 class WSDissector:
-    """Wrapper for ws_dissector tool"""
+    """Wrapper for ws_dissector tool with automatic platform detection"""
 
     def __init__(self, dissector_path=None):
         """Initialize ws_dissector wrapper
 
         Args:
             dissector_path: Path to ws_dissector executable. If None,
-                          assumes it's in the ws_dissector subdirectory.
+                          automatically detects platform and uses appropriate binary:
+                          - ws_desktop_dissector for desktop platforms
+                          - ws_dissector for Android
         """
         self.logger = logging.getLogger(__name__)
         self.packets_processed = 0
         self.packets_failed = 0
 
         if dissector_path is None:
-            self.dissector_path = os.path.join(os.path.dirname(__file__), 'ws_dissector')
+            # Detect platform and choose appropriate binary
+            platform_type = self._detect_platform()
+            if platform_type == 'android':
+                binary_name = 'ws_dissector'
+            else:
+                binary_name = 'ws_desktop_dissector'
+
+            self.dissector_path = os.path.join(os.path.dirname(__file__), 'ws_dissector', binary_name)
+            self.logger.info(f"Detected platform: {platform_type}, using binary: {binary_name}")
         else:
             self.dissector_path = dissector_path
 
         self._validate_dissector()
+
+    def _detect_platform(self):
+        """Detect if running on Android or desktop platform
+
+        Returns:
+            str: 'android' or 'desktop'
+        """
+        # Check for Android-specific indicators
+        if (platform.system() == 'Linux' and
+            (os.path.exists('/system/bin/sh') or
+             os.environ.get('ANDROID_ROOT') or
+             os.path.exists('/system/build.prop'))):
+            return 'android'
+
+        # Default to desktop for macOS, Linux, Windows, etc.
+        return 'desktop'
 
     def _validate_dissector(self):
         """Validate that the dissector executable exists and is accessible"""
@@ -345,13 +373,13 @@ def create_argument_parser():
         formatter_class=argparse.RawDescriptionHelpFormatter,
         epilog="""
 Examples:
-  %(prog)s packets.json -o dissected.xml    # Process packets and save to XML
-  %(prog)s packets.json                   # Process with auto-generated output file
+  %(prog)s packets.json -o dissected.xml    # Process packets and save to custom path
+  %(prog)s packets.json                   # Process with auto-generated file in output/ folder
         """
     )
 
     parser.add_argument('input', help='Input object array or dictionary containing packets')
-    parser.add_argument('-o', '--output', help='Output file dissected_<timestamp>.xml')
+    parser.add_argument('-o', '--output', help='Output file path. If not specified, saves to output/dissected_<timestamp>.xml')
 
     return parser
 
@@ -370,7 +398,10 @@ def main():
         output_file = args.output
         if not output_file:
             timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
-            output_file = f"dissected_{timestamp}.xml"
+            # Use output folder relative to this script's location
+            output_dir = os.path.join(os.path.dirname(os.path.dirname(__file__)), 'output')
+            os.makedirs(output_dir, exist_ok=True)
+            output_file = os.path.join(output_dir, f"dissected_{timestamp}.xml")
 
         # Initialize dissector
         dissector = WSDissector()
