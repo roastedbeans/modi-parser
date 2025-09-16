@@ -1,0 +1,18 @@
+# Requirements for modi-parser
+# Compatible with Python 3.9
+
+# Core dependencies
+packaging>=21.0
+bitstring>=3.1.7
+
+# Optional dependencies
+# libscrc: For enhanced CRC calculations
+libscrc>=1.0.0
+
+# pyshark: For PCAP file analysis and CSV export
+pyshark>=0.4.0
+
+# Development dependencies (uncomment if needed)
+# pytest>=6.0.0
+# black>=21.0.0
+# flake8>=3.9.0
