@@ -1,4 +1,4 @@
-#!/usr/bin/python3.9
+#!/usr/bin/python3.8
 # coding: utf8
 
 from enum import IntEnum, unique
