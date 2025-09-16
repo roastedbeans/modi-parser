@@ -7,11 +7,10 @@ Extracts packets from QMDL files and correctly classifies them based on the actu
 parser logic, not GSMTAP headers. Returns dictionaries with protocol numbers from mapping.json.
 """
 
-import logging
-import os
+import logging 
 from fileio import FileIO
 from qualcomm.qualcommparser import QualcommParser
-from ws_dissector.ws_wrapper import WSDissector
+from ws_wrapper import WSDissector
 from datetime import datetime
 from pdml_to_table import PdmlToTableConverter
 

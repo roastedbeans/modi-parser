@@ -3,7 +3,6 @@
 
 import xml.etree.ElementTree as ET
 import csv
-import os
 import re
 from pathlib import Path
 
