@@ -299,5 +299,9 @@ if __name__ == "__main__":
     if converter.convert_pdml_to_csv(output_file):
         csv_file = output_file.replace('.xml', '.csv')
         print(f"✅ Successfully converted PDML to CSV: {csv_file}")
+        
+    if converter.convert_pdml_to_csv(output_file, expanded=True):
+        csv_file = output_file.replace('.xml', '_expanded.csv')
+        print(f"✅ Successfully converted PDML to CSV: {csv_file}")
     else:
         print("❌ Failed to convert PDML to CSV")

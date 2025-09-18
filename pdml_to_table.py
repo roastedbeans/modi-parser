@@ -6,14 +6,19 @@ import csv
 import re
 from pathlib import Path
 
+
 class PdmlToTableConverter:
-    def __init__(self):
+    def __init__(self, excluded_fields=None):
         self.all_fields = set()
         self.packet_data = []
         self.nas_packets = []
         self.rrc_packets = []
         self.nas_fields = set()
         self.rrc_fields = set()
+        # Set of field names to exclude from CSV headers
+        self.excluded_fields = set(excluded_fields) if excluded_fields else set()
+        # Add default exclusions
+        self.excluded_fields.update(['MCC_MNC_Digit', 'lte-rrc.bCCH_DL_SCH_Message.message'])
 
     def _slugify(self, text):
         """Convert text to slug format with underscores"""
@@ -21,11 +26,9 @@ class PdmlToTableConverter:
             return ""
 
         # Replace spaces and special characters with underscores
-        text = re.sub(r'[^\w\s]', '_', text)
+        text = re.sub(r'[^\w\s-]', '_', text)
         # Replace multiple spaces/underscores with single underscore
         text = re.sub(r'[\s_]+', '_', text)
-        # Replace dashes with underscores
-        text = re.sub(r'-', '_', text)
         # Remove leading/trailing underscores
         text = text.strip('_')
         # Convert to lowercase
@@ -33,227 +36,265 @@ class PdmlToTableConverter:
 
     def _classify_packet_type(self, packet):
         """Classify packet as NAS, RRC, or other based on protocol content"""
-        # Look for protocol-specific fields to classify the packet
         fields = packet.findall('.//field')
-
         nas_count = 0
         rrc_count = 0
 
+        # Pre-compile patterns for better performance
+        nas_patterns = {'nas', 'emm', 'esm', 'lte_nas'}
+        rrc_patterns = {'rrc', 'bcch', 'dcch', 'ccch', 'pcch'}
+
         for field in fields:
-            field_name = field.get('name', '')
+            field_name = field.get('name', '').lower().replace('-', '_')
             if not field_name:
                 continue
 
-            # Count pure NAS indicators
-            if ('nas' in field_name.lower() or
-                'emm' in field_name.lower() or
-                'esm' in field_name.lower() or
-                'lte_nas' in field_name.replace('-', '_').lower()):
-                # Check if it's NOT also an RRC field (avoid double counting mixed fields)
-                has_rrc_in_name = ('rrc' in field_name.lower() or
-                                  'bcch' in field_name.lower() or
-                                  'dcch' in field_name.lower() or
-                                  'ccch' in field_name.lower() or
-                                  'pcch' in field_name.lower())
-                if not has_rrc_in_name:
-                    nas_count += 1
+            has_nas = any(pattern in field_name for pattern in nas_patterns)
+            has_rrc = any(pattern in field_name for pattern in rrc_patterns)
 
-            # Count pure RRC indicators
-            if ('rrc' in field_name.lower() or
-                'bcch' in field_name.lower() or
-                'dcch' in field_name.lower() or
-                'ccch' in field_name.lower() or
-                'pcch' in field_name.lower()):
-                # Check if it's NOT also a NAS field (avoid double counting mixed fields)
-                has_nas_in_name = ('nas' in field_name.lower() or
-                                  'emm' in field_name.lower() or
-                                  'esm' in field_name.lower() or
-                                  'lte_nas' in field_name.replace('-', '_').lower())
-                if not has_nas_in_name:
-                    rrc_count += 1
+            # Count pure indicators (avoid double counting mixed fields)
+            if has_nas and not has_rrc:
+                nas_count += 1
+            elif has_rrc and not has_nas:
+                rrc_count += 1
 
-        # Classify based on majority rule
         total_classified = nas_count + rrc_count
-
         if total_classified == 0:
             return 'other'
 
-        # Use majority rule: if one type has more than 50% of classified fields
-        nas_ratio = nas_count / total_classified
-        rrc_ratio = rrc_count / total_classified
-
-        if nas_ratio > 0.5:
+        # Use majority rule
+        if nas_count > rrc_count:
             return 'nas'
-        elif rrc_ratio > 0.5:
+        elif rrc_count > nas_count:
             return 'rrc'
         else:
-            # If roughly equal, check for specific RRC message types
+            # If tied, check for specific RRC message types
             for field in fields:
                 field_name = field.get('name', '')
-                if ('rrcConnection' in field_name or
-                    'systemInformation' in field_name or
-                    'paging' in field_name):
+                if any(msg in field_name for msg in ['rrcConnection', 'systemInformation', 'paging']):
                     return 'rrc'
-            # Default to RRC for LTE packets (more common)
-            return 'rrc'
+            return 'rrc'  # Default for LTE packets
 
-    def _convert_hex_to_decimal(self, value):
-        """Convert various hex formats to decimal"""
-        if not value:
-            return value
-
-        # Handle different hex formats
-        try:
-            # Remove common separators and prefixes
-            cleaned_value = value.replace(':', '').replace(' ', '').replace('0x', '').replace('0X', '')
-
-            # Check if it's a valid hex string (contains only hex characters)
-            if all(c in '0123456789abcdefABCDEF' for c in cleaned_value):
-                # Convert to decimal
-                return str(int(cleaned_value, 16))
-            else:
-                # Not a valid hex, return original
-                return value
-        except (ValueError, TypeError, OverflowError):
-            # If conversion fails, return original value
-            return value
-
-    def _normalize_field_value(self, value):
-        """Normalize field value, converting empty/invalid values to -1"""
-        # Handle None values
-        if value is None:
+    def _normalize_field_value(self, value, field_type=None):
+        """
+        Unified normalization function for all field values
+        field_type: 'name', 'showname', 'size', 'pos', 'show', 'value', 'unmasked'
+        """
+        # Handle None or empty
+        if value is None or value == '':
+            if field_type == 'name':
+                return '-1'
+            elif field_type == 'showname':
+                return '-1'
+            elif field_type in ['size', 'pos']:
+                return '-1'
+            elif field_type == 'show':
+                return '-1'
+            elif field_type in ['value', 'unmasked']:
+                return '-1'
             return '-1'
 
-        # Handle empty strings and whitespace-only strings
-        if isinstance(value, str):
-            if value.strip() == '':
-                return '-1'
+        value_str = str(value).strip()
 
-            # Handle specific invalid values that should be treated as empty
-            invalid_values = ['N/A', 'n/a', 'NULL', 'null', 'None', 'none', '-', '--', '---']
-            if value.strip().lower() in invalid_values:
-                return '-1'
-
-        # Handle other falsy values (but not 0, False, etc. which might be valid)
-        # Only treat truly empty cases as -1
-        if value == '':
+        # Handle invalid markers
+        if value_str.lower() in {'n/a', 'null', 'none'}:
             return '-1'
 
-        # Return the original value if it's not empty/invalid
-        return value
+        # Type-specific normalization
+        if field_type == 'name':
+            # Binary: 1 if present, 0 if empty
+            return '1' if value_str else '0'
 
-    def _extract_mcc_mnc_digits(self, field_element, field_type):
-        """Extract and combine MCC/MNC digits into a single value"""
-        try:
-            # Find all MCC_MNC_Digit fields within this MCC/MNC field
-            digit_fields = field_element.findall('.//field[@name="lte-rrc.MCC_MNC_Digit"]')
+        elif field_type == 'showname':
+            # Hash to 3 digits (100-999)
+            if not value_str:
+                return '100'
+            hash_val = 0
+            for i, char in enumerate(value_str):
+                hash_val = (hash_val * 31 + ord(char)) % 900
+            return str(hash_val + 100)
 
-            if not digit_fields:
-                return None
+        elif field_type in ['size', 'pos']:
+            # Keep numeric values as-is
+            return value_str if value_str else '0'
 
-            # Extract the digit values from the show attribute
-            digits = []
-            for digit_field in digit_fields:
-                show_value = digit_field.get('show', '')
-                # The show value is already the digit we need
-                if show_value and show_value.isdigit():
-                    digits.append(show_value)
+        elif field_type == 'show':
+            # Normalize to single digit
+            if value_str == 'True':
+                return '1'
+            elif value_str == 'False':
+                return '0'
 
-            if not digits:
-                return None
+            # Handle numeric values
+            if value_str.replace('-', '').replace('.', '').isdigit():
+                try:
+                    num = abs(int(float(value_str)))
+                    return str(min(num, 9))
+                except:
+                    pass
 
-            # Combine digits into MCC/MNC value
-            combined = ''.join(digits)
+            # Hash text to single digit
+            hash_val = sum(ord(c) for c in value_str) % 10
+            return str(hash_val)
 
-            # For MCC, ensure it's 3 digits, for MNC ensure it's 2-3 digits
-            if field_type == 'mcc' and len(combined) == 3:
-                return combined
-            elif field_type == 'mnc' and 2 <= len(combined) <= 3:
-                # Pad MNC with leading zero if needed for 2 digits
-                return combined.zfill(2) if len(combined) == 2 else combined
+        elif field_type in ['value', 'unmasked']:
+            # Normalize hex payloads and values to 2 digits
+            if len(value_str) > 8:
+                is_hex = all(c in '0123456789abcdefABCDEF' for c in value_str)
+                if is_hex:
+                    try:
+                        first = int(value_str[:2], 16) if len(value_str) >= 2 else 0
+                        last = int(value_str[-2:], 16) if len(value_str) >= 2 else 0
+                        result = (first ^ last) % 100
+                        return f'{result:02d}'
+                    except:
+                        return '99'
 
-            return None
+            # Short values - keep or pad
+            if len(value_str) <= 4:
+                if value_str.isdigit():
+                    return value_str.zfill(2)
+                return value_str
 
-        except Exception as e:
-            # If extraction fails, return None
-            return None
+            # Hash medium values to 2 digits
+            hash_val = sum(ord(c) * (i + 1) for i, c in enumerate(value_str[:10])) % 100
+            return f'{hash_val:02d}'
+
+        # Default: return as-is
+        return value_str
+
+    def _should_skip_field(self, field_name):
+        """Check if a field should be skipped based on its protocol"""
+        if not field_name:
+            return True
+
+        # Skip fields from these protocol layers
+        skip_prefixes = ('geninfo.', 'frame.', 'user_dlt.', 'aww.')
+        if field_name.startswith(skip_prefixes):
+            return True
+
+        # Skip known geninfo fields
+        geninfo_fields = {'num', 'len', 'caplen', 'timestamp'}
+        if field_name in geninfo_fields:
+            return True
+
+        # Skip fields in the exclusion list
+        for excluded_field in self.excluded_fields:
+            if excluded_field in field_name:
+                return True
+
+        return False
+
+    def _process_field_values(self, field_element):
+        """Process field values with normalization - adds -1 for empty attributes"""
+        normalized_attributes = []
+
+        # Always process name first (required)
+        field_name = field_element.get('name', '')
+        normalized_attributes.append(self._normalize_field_value(field_name, 'name'))
+
+        # Check and process optional attributes in order
+        optional_attrs = [
+            ('showname', 'showname'),
+            ('size', 'size'),
+            ('pos', 'pos'),
+            ('show', 'show'),
+            ('value', 'value'),
+            ('unmaskedvalue', 'unmasked')
+        ]
+
+        for attr_name, field_type in optional_attrs:
+            if attr_name in field_element.attrib:
+                # Get the value - could be empty string
+                value = field_element.get(attr_name)
+                # Normalize will convert empty string to -1
+                normalized_value = self._normalize_field_value(value, field_type)
+                normalized_attributes.append(normalized_value)
+            # Note: We don't append -1 here for missing attributes
+            # because different fields have different numbers of attributes
+            # The -1 padding happens in generate_csv functions
+
+        return normalized_attributes
 
     def parse_pdml(self, pdml_file, separate_by_protocol=True):
-        """Parse PDML XML file and extract field data
-
-        Args:
-            pdml_file: Path to the PDML XML file
-            separate_by_protocol: If True, separate packets by NAS/RRC type
-
-        Returns:
-            bool: True if parsing successful, False otherwise
-        """
+        """Parse PDML XML file and extract field data"""
         try:
             tree = ET.parse(pdml_file)
             root = tree.getroot()
 
-            # Find only direct packet children to avoid nested packet duplication
-            packets = [child for child in root if child.tag == 'packet' and child.get('number')]
-
-            for packet_idx, packet in enumerate(packets):
-                packet_info = self._extract_packet_fields(packet, packet_idx)
-                if packet_info:
-                    if separate_by_protocol:
-                        # Classify packet type and store in appropriate collection
-                        packet_type = self._classify_packet_type(packet)
-
-                        if packet_type == 'nas':
-                            self.nas_packets.append(packet_info)
-                            # Update NAS-specific field set
-                            for key in packet_info.keys():
-                                if key != 'packet_number':
-                                    self.nas_fields.add(key)
-                        elif packet_type == 'rrc':
-                            self.rrc_packets.append(packet_info)
-                            # Update RRC-specific field set
-                            for key in packet_info.keys():
-                                if key != 'packet_number':
-                                    self.rrc_fields.add(key)
+            # Handle both ws_dissector format (pdml_capture) and tshark format (pdml)
+            if root.tag == 'pdml_capture':
+                # ws_dissector format - packets are nested
+                packets = []
+                for child in root:
+                    if child.tag == 'packet' and child.get('number'):
+                        # Find the nested packet element
+                        nested_packets = child.findall('packet')
+                        if nested_packets:
+                            packets.append((child.get('number'), nested_packets[0]))
                         else:
-                            # For other packets, add to general collection
+                            packets.append((child.get('number'), child))
+            else:
+                # tshark format - direct packet elements
+                packets = []
+                packet_num = 1
+                for child in root:
+                    if child.tag == 'packet':
+                        packets.append((str(packet_num), child))
+                        packet_num += 1
+
+            for packet_num, packet in packets:
+                try:
+                    packet_info = self._extract_packet_fields(packet, int(packet_num) - 1)
+                    if packet_info:
+                        if separate_by_protocol:
+                            packet_type = self._classify_packet_type(packet)
+
+                            if packet_type == 'nas':
+                                self.nas_packets.append(packet_info)
+                                self._update_field_set(packet_info, self.nas_fields)
+                            elif packet_type == 'rrc':
+                                self.rrc_packets.append(packet_info)
+                                self._update_field_set(packet_info, self.rrc_fields)
+                            else:
+                                self.packet_data.append(packet_info)
+                                self._update_field_set(packet_info, self.all_fields)
+                        else:
                             self.packet_data.append(packet_info)
-                            for key in packet_info.keys():
-                                if key != 'packet_number':
-                                    self.all_fields.add(key)
-                    else:
-                        # Unified mode - add all packets to general collection
-                        self.packet_data.append(packet_info)
-                        for key in packet_info.keys():
-                            if key != 'packet_number':
-                                self.all_fields.add(key)
+                            self._update_field_set(packet_info, self.all_fields)
+                except Exception as e:
+                    print(f"Error processing packet {packet_num}: {e}")
+                    continue
 
             return True
-
         except Exception as e:
+            print(f"Error parsing PDML file: {e}")
             return False
 
-    def convert_pdml_to_csv(self, pdml_file, csv_file=None, separate_by_protocol=True):
-        """Convert PDML file to CSV(s) in one step
+    def _update_field_set(self, packet_info, field_set):
+        """Update field set with packet fields (excluding packet_number)"""
+        for key in packet_info.keys():
+            if key != 'packet_number':
+                field_set.add(key)
 
-        Args:
-            pdml_file: Path to the PDML XML file
-            csv_file: Path to output CSV file. If None, uses pdml_file.csv
-            separate_by_protocol: If True, creates separate CSVs for NAS and RRC packets
-
-        Returns:
-            bool: True if conversion successful, False otherwise
-        """
+    def convert_pdml_to_csv(self, pdml_file, csv_file=None, separate_by_protocol=True, expanded=False):
+        """Convert PDML file to CSV(s) in one step"""
         if csv_file is None:
             csv_file = str(Path(pdml_file).with_suffix('.csv'))
 
         if self.parse_pdml(pdml_file, separate_by_protocol):
             if separate_by_protocol:
-                return self.generate_separate_csvs(csv_file)
+                if expanded:
+                    return self.generate_separate_csvs_expanded(csv_file)
+                else:
+                    return self.generate_separate_csvs(csv_file)
             else:
-                return self.generate_csv(csv_file, self.packet_data, self.all_fields)
+                if expanded:
+                    return self.generate_csv_expanded(csv_file, self.packet_data, self.all_fields)
+                else:
+                    return self.generate_csv(csv_file, self.packet_data, self.all_fields)
 
         return False
-
 
     def _extract_packet_fields(self, packet, packet_idx):
         """Extract all fields from a single packet with hierarchical naming"""
@@ -262,11 +303,9 @@ class PdmlToTableConverter:
         # Find the nested packet that contains the actual data
         nested_packets = packet.findall('packet')
         if nested_packets:
-            # Use the first nested packet for field extraction
             data_packet = nested_packets[0]
             fields = data_packet.findall('.//field')
         else:
-            # Fallback to recursive search if no nested packet
             fields = packet.findall('.//field')
 
         for field in fields:
@@ -274,149 +313,87 @@ class PdmlToTableConverter:
 
         return packet_info
 
-    def _should_skip_field(self, field_name):
-        """Check if a field should be skipped based on its protocol"""
-        if not field_name:
-            return False
-
-        # Skip fields from these protocol layers
-        skip_prefixes = ('geninfo.', 'frame.', 'user_dlt.', 'aww.')
-        if field_name.startswith(skip_prefixes):
-            return True
-
-        # Also skip known geninfo fields that don't have the geninfo. prefix
-        geninfo_fields = {'num', 'len', 'caplen', 'timestamp'}
-        if field_name in geninfo_fields:
-            return True
-
-        return False
-
     def _extract_field_recursively(self, field_element, parent_path, packet_info):
         """Recursively extract field data with filtering"""
         field_name = field_element.get('name', '')
 
-        # Skip fields with empty name
-        if not field_name:
+        # Early skip checks
+        if (not field_name or 
+            self._should_skip_field(field_name) or 
+            field_element.get('hide') == 'yes'):
             return
 
-        # Skip fields from unwanted protocols (geninfo, frame, user_dlt, aww)
-        if self._should_skip_field(field_name):
-            return
-
-        # Skip fields with hide="yes"
-        if field_element.get('hide') == 'yes':
-            return
-
-        # Get show and value attributes
+        # Check for required attributes
         field_show = field_element.get('show', '')
         field_value = field_element.get('value', '')
-
-        # Skip fields that don't have both show and value
         if not field_show or not field_value:
             return
 
         # Build hierarchical field name
-        if parent_path:
-            full_field_name = f"{parent_path}.{field_name}"
-        else:
-            full_field_name = field_name
+        full_field_name = f"{parent_path}.{field_name}" if parent_path else field_name
 
-        # Special handling for MCC/MNC fields - extract and combine digits
-        if field_name.endswith('.mcc') or field_name.endswith('.mnc'):
-            field_type = 'mcc' if field_name.endswith('.mcc') else 'mnc'
-            combined_digits = self._extract_mcc_mnc_digits(field_element, field_type)
-            if combined_digits is not None:
-                field_show = combined_digits
-                field_value = combined_digits
+        # Process field values into combined array format
+        field_data_array = self._process_field_values(field_element)
 
-        # Convert hex value to decimal if it's a valid hex number
-        field_value = self._convert_hex_to_decimal(field_value)
-        field_show = self._convert_hex_to_decimal(field_show)
-
-
-        # Create slugified headers for show and value
-        show_header = self._slugify(f"{full_field_name}_show")
-        value_header = self._slugify(f"{full_field_name}_value")
-
-        # Store both field mappings
-        self.all_fields.add(show_header)
-        self.all_fields.add(value_header)
-
-        # Change True/False to 1/0
-        if field_show == 'True':
-            field_show = '1'
-        elif field_show == 'False':
-            field_show = '0'
-        if field_value == 'True':
-            field_value = '1'
-        elif field_value == 'False':
-            field_value = '0'
-
-        # If field data is empty or no value, set it to -1
-        # Handle various empty/invalid cases comprehensively
-        field_show = self._normalize_field_value(field_show)
-        field_value = self._normalize_field_value(field_value)
+        # Create header (just the field name without suffixes)
+        header = self._slugify(full_field_name)
+        self.all_fields.add(header)
         
+        # Store the combined array as the field value
+        packet_info[header] = field_data_array
 
-        # Store the values
-        packet_info[show_header] = field_show
-        packet_info[value_header] = field_value
-        
-
-
-        # Recursively process sub-fields (but skip MCC_MNC_Digit fields as they're handled above)
+        # Recursively process sub-fields
         sub_fields = field_element.findall('field')
         for sub_field in sub_fields:
-            sub_field_name = sub_field.get('name', '')
-            # Skip MCC_MNC_Digit fields as they're already processed in parent MCC/MNC
-            if not sub_field_name.endswith('.MCC_MNC_Digit'):
-                self._extract_field_recursively(sub_field, full_field_name, packet_info)
+            self._extract_field_recursively(sub_field, full_field_name, packet_info)
 
     def generate_separate_csvs(self, base_filename):
-        """Generate separate CSV files for NAS and RRC packets
-
-        Args:
-            base_filename: Base filename for the CSV files
-
-        Returns:
-            bool: True if all conversions successful, False otherwise
-        """
+        """Generate separate CSV files for NAS and RRC packets"""
         success = True
+        base_path = Path(base_filename)
 
-        # Generate NAS CSV if there are NAS packets
-        if self.nas_packets:
-            # Python 3.8 compatible: manually construct path with suffix
-            base_path = Path(base_filename)
-            nas_filename = str(base_path.parent / (base_path.stem + '_nas' + base_path.suffix))
-            if not self.generate_csv(nas_filename, self.nas_packets, self.nas_fields):
-                success = False
+        # Generate CSVs for each packet type
+        csv_configs = [
+            (self.nas_packets, self.nas_fields, '_nas'),
+            (self.rrc_packets, self.rrc_fields, '_rrc'),
+            (self.packet_data, self.all_fields, '')
+        ]
 
-        # Generate RRC CSV if there are RRC packets
-        if self.rrc_packets:
-            # Python 3.8 compatible: manually construct path with suffix
-            base_path = Path(base_filename)
-            rrc_filename = str(base_path.parent / (base_path.stem + '_rrc' + base_path.suffix))
-            if not self.generate_csv(rrc_filename, self.rrc_packets, self.rrc_fields):
-                success = False
-
-        # Generate general CSV if there are other packets
-        if self.packet_data:
-            if not self.generate_csv(base_filename, self.packet_data, self.all_fields):
-                success = False
+        for packets, fields, suffix in csv_configs:
+            if packets:
+                filename = str(base_path.parent / (base_path.stem + suffix + base_path.suffix))
+                if not self.generate_csv(filename, packets, fields):
+                    success = False
 
         return success
 
+    def generate_separate_csvs_expanded(self, base_filename):
+        """Generate separate expanded CSV files for NAS and RRC packets"""
+        success = True
+        base_path = Path(base_filename)
+
+        # Generate expanded CSVs for each packet type
+        csv_configs = [
+            (self.nas_packets, self.nas_fields, '_nas_expanded'),
+            (self.rrc_packets, self.rrc_fields, '_rrc_expanded'),
+            (self.packet_data, self.all_fields, '_expanded')
+        ]
+
+        for packets, fields, suffix in csv_configs:
+            if packets:
+                filename = str(base_path.parent / (base_path.stem + suffix + base_path.suffix))
+                if not self.generate_csv_expanded(filename, packets, fields):
+                    success = False
+
+        return success
+
+
+
+
+
+
     def generate_csv(self, output_file, packet_collection=None, field_collection=None):
-        """Generate CSV file from extracted data with show/value columns
-
-        Args:
-            output_file: Path to output CSV file
-            packet_collection: Collection of packets to write (default: self.packet_data)
-            field_collection: Collection of fields to include (default: self.all_fields)
-
-        Returns:
-            bool: True if generation successful, False otherwise
-        """
+        """Generate CSV file with normalized data in structured format"""
         try:
             if packet_collection is None:
                 packet_collection = self.packet_data
@@ -424,32 +401,199 @@ class PdmlToTableConverter:
                 field_collection = self.all_fields
 
             if not packet_collection:
+                print("No packet data to write to CSV")
                 return False
 
-            # Create ordered list of fields (packet_number first, then sorted show/value pairs)
-            field_list = ['packet_number'] + sorted(field_collection)
+            # Determine protocol type for labeling
+            if packet_collection is self.rrc_packets:
+                protocol_type = "RRC"
+                label = 0
+            elif packet_collection is self.nas_packets:
+                protocol_type = "NAS"
+                label = 1
+            else:
+                # Default to RRC if can't determine
+                protocol_type = "RRC"
+                label = 0
 
-            # Write CSV file
+            # First pass: determine max attributes for each field
+            field_max_attrs = {}
+            for field in sorted(field_collection):
+                max_attrs = 0
+                for packet in packet_collection:
+                    if field in packet:
+                        field_array = packet.get(field, [])
+                        if isinstance(field_array, list):
+                            max_attrs = max(max_attrs, len(field_array))
+                # Default to at least 1 attribute if field never appears
+                field_max_attrs[field] = max_attrs if max_attrs > 0 else 1
+
+            # Create headers: data and label
+            headers = ['data', 'label']
+
             with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
                 writer = csv.writer(csvfile)
+                writer.writerow(headers)
 
-                # Write header
-                writer.writerow(field_list)
+                for packet in packet_collection:
+                    # Build data string with all fields
+                    data_parts = []
+                    for field in sorted(field_collection):
+                        field_array = packet.get(field, None)
+                        expected_attrs = field_max_attrs[field]
 
-                # Write data rows
+                        if field_array is None:
+                            # Field not present in this packet - use -1 for expected number of attributes
+                            empty_array = ['-1'] * expected_attrs
+                            array_str = '[' + ', '.join(empty_array) + ']'
+                            data_parts.append(f"{field} : {array_str}")
+                        elif isinstance(field_array, list) and field_array:
+                            # Field exists with data - pad if needed
+                            padded_array = field_array[:]
+                            while len(padded_array) < expected_attrs:
+                                padded_array.append('-1')
+                            array_str = '[' + ', '.join(str(item) for item in padded_array) + ']'
+                            data_parts.append(f"{field} : {array_str}")
+                        else:
+                            # Field exists but empty or invalid
+                            empty_array = ['-1'] * expected_attrs
+                            array_str = '[' + ', '.join(empty_array) + ']'
+                            data_parts.append(f"{field} : {array_str}")
+
+                    # Join all field data with semicolons
+                    field_data_str = '; '.join(data_parts)
+
+                    # Add protocol identifier prefix
+                    data_str = f"{protocol_type} - {field_data_str}"
+
+                    # Write row with data and label
+                    writer.writerow([data_str, label])
+
+            print(f"Successfully wrote {len(packet_collection)} packets to {output_file}")
+            return True
+        except Exception as e:
+            print(f"Error writing CSV file: {e}")
+            return False
+
+    def generate_csv_expanded(self, output_file, packet_collection=None, field_collection=None):
+        """Generate CSV file with expanded field attributes as separate columns"""
+        try:
+            if packet_collection is None:
+                packet_collection = self.packet_data
+            if field_collection is None:
+                field_collection = self.all_fields
+
+            if not packet_collection:
+                print("No packet data to write to CSV")
+                return False
+
+            # Determine protocol type for labeling
+            if packet_collection is self.rrc_packets:
+                label = 0
+            elif packet_collection is self.nas_packets:
+                label = 1
+            else:
+                # Default to RRC if can't determine
+                label = 0
+
+            # First pass: determine which attributes each field actually has
+            field_attributes_map = {}
+            for field in sorted(field_collection):
+                field_attributes_map[field] = set()
+                for packet in packet_collection:
+                    if field in packet:
+                        field_array = packet.get(field, [])
+                        if isinstance(field_array, list):
+                            # Track actual number of attributes for this field
+                            field_attributes_map[field].add(len(field_array))
+            
+                # Ensure at least 1 attribute column for empty fields
+                if not field_attributes_map[field]:
+                    field_attributes_map[field].add(1)
+
+            # Define possible attribute names based on position
+            attr_position_names = ['_name', '_showname', '_size', '_pos', '_show', '_value', '_unmasked']
+
+            # Create headers based on actual attributes present
+            headers = []
+            for field in sorted(field_collection):
+                max_attrs = max(field_attributes_map[field]) if field_attributes_map[field] else 1
+                for i in range(max_attrs):
+                    if i < len(attr_position_names):
+                        headers.append(f"{field}{attr_position_names[i]}")
+                    else:
+                        headers.append(f"{field}_attr_{i}")
+
+            # Add label column header
+            headers.append('label')
+
+            with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(headers)
+
                 for packet in packet_collection:
                     row = []
-                    for field in field_list:
-                        value = packet.get(field, '')
-                        # Apply normalization to missing/empty fields
-                        if field != 'packet_number':  # Don't normalize packet numbers
-                            value = self._normalize_field_value(value)
-                        row.append(value)
+
+                    for field in sorted(field_collection):
+                        field_array = packet.get(field, None)
+                        max_attrs = max(field_attributes_map[field]) if field_attributes_map[field] else 1
+
+                        if field_array is None:
+                            # Field not present - fill with -1
+                            for _ in range(max_attrs):
+                                row.append('-1')
+                        elif isinstance(field_array, list) and field_array:
+                            # Add actual values from array
+                            for i in range(max_attrs):
+                                if i < len(field_array):
+                                    row.append(field_array[i])
+                                else:
+                                    row.append('-1')  # Pad missing attributes with -1
+                        else:
+                            # Field exists but invalid - fill with -1
+                            for _ in range(max_attrs):
+                                row.append('-1')
+
+                    # Add label to the row
+                    row.append(label)
                     writer.writerow(row)
 
+            print(f"Successfully wrote {len(packet_collection)} packets to expanded CSV {output_file}")
             return True
-
         except Exception as e:
+            print(f"Error writing expanded CSV file: {e}")
             return False
 
 
+if __name__ == "__main__":
+    """Example usage demonstrating both regular and expanded CSV formats"""
+
+    # Example usage with an existing XML file
+    xml_files = list(Path('.').glob('*.xml'))
+    if xml_files:
+        xml_file = str(xml_files[0])  # Use first XML file found
+        print(f"Converting {xml_file} to CSV formats...")
+
+        converter = PdmlToTableConverter()
+
+        # Generate regular CSV (structured format)
+        print("\n1. Generating regular CSV with structured data format:")
+        if converter.convert_pdml_to_csv(xml_file, expanded=False):
+            csv_file = xml_file.replace('.xml', '.csv')
+            print(f"   ✅ Regular CSV: {csv_file}")
+
+        # Generate expanded CSV (separate columns for each field attribute)
+        print("\n2. Generating expanded CSV with separate columns:")
+        if converter.convert_pdml_to_csv(xml_file, expanded=True):
+            expanded_csv_file = xml_file.replace('.xml', '_expanded.csv')
+            print(f"   ✅ Expanded CSV: {expanded_csv_file}")
+
+        print("\nNote: The regular CSV format includes protocol identification and labels:")
+        print("      data, label")
+        print("      RRC data - field1 : [val1, val2]; field2 : [val3]; ..., 0")
+        print("      NAS data - field1 : [val1, val2]; field2 : [val3]; ..., 1")
+        print("\n      The expanded CSV format creates separate columns for each field attribute plus label:")
+        print("      - field_name_name, field_name_showname, field_name_size, ..., label")
+
+    else:
+        print("No XML files found in current directory. Please provide an XML file to convert.")
