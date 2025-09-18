@@ -10,11 +10,12 @@ import string
 import struct
 
 try:
-    import libscrc
-    has_libscrc = True
+    import crcmod.predefined
+    has_crcmod = True
+    # Use predefined X.25 CRC function
+    crc16_x25_func = crcmod.predefined.mkPredefinedCrcFun('x-25')
 except ModuleNotFoundError:
-    has_libscrc = False
-
+    has_crcmod = False
 
 bitstring_ver = version.parse(bitstring.__version__)
 if bitstring_ver >= version.parse('4.2.0'):
@@ -64,8 +65,8 @@ crc_table = [
     ]
 
 def dm_crc16(arr):
-    if has_libscrc:
-        return libscrc.x25(arr)
+    if has_crcmod:
+        return crc16_x25_func(arr)
     else:
         ret = 0xffff
         for b in arr:

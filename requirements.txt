@@ -7,7 +7,10 @@ bitstring>=3.1.7
 
 # Optional dependencies
 # libscrc: For enhanced CRC calculations
-libscrc>=1.0.0
+libscrc>=1.8.0
+
+# crcmod: For CRC calculations
+crcmod>=1.7
 
 # pyshark: For PCAP file analysis and CSV export
 pyshark>=0.4.0
