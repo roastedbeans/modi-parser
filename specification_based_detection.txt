@@ -1,0 +1,344 @@
+import xml.etree.ElementTree as ET
+from datetime import datetime
+from dataclasses import dataclass
+from typing import List, Dict, Optional
+
+@dataclass
+class NASMessage:
+    timestamp: float
+    message_type: str
+    cause_code: Optional[int]
+    integrity_protected: bool
+    establishment_cause: Optional[str]
+    imsi: Optional[str]
+    tmsi: Optional[str]
+    sequence_number: Optional[int]
+
+@dataclass
+class RRCMessage:
+    timestamp: float
+    message_type: str
+    establishment_cause: Optional[str]
+    ue_identity: Optional[str]
+    rnti: Optional[str]
+
+@dataclass
+class DetectionAlert:
+    rule_id: str
+    severity: str
+    description: str
+    timestamp: float
+    evidence: Dict
+
+class AdaptOverDetector:
+    def __init__(self):
+        self.nas_messages = []
+        self.rrc_messages = []
+        self.alerts = []
+        
+    def parse_pdml(self, pdml_file_path: str):
+        """Parse PDML file and extract NAS/RRC messages"""
+        tree = ET.parse(pdml_file_path)
+        root = tree.getroot()
+        
+        for packet in root.findall('.//packet'):
+            timestamp = float(packet.find('.//field[@name="frame.time_epoch"]').get('value', 0))
+            
+            # Parse NAS messages
+            nas_msg = self._extract_nas_message(packet, timestamp)
+            if nas_msg:
+                self.nas_messages.append(nas_msg)
+                
+            # Parse RRC messages  
+            rrc_msg = self._extract_rrc_message(packet, timestamp)
+            if rrc_msg:
+                self.rrc_messages.append(rrc_msg)
+    
+    def _extract_nas_message(self, packet, timestamp) -> Optional[NASMessage]:
+        """Extract NAS message details from packet"""
+        nas_field = packet.find('.//field[@name="nas-eps"]')
+        if not nas_field:
+            return None
+            
+        msg_type = self._get_field_value(nas_field, 'nas_eps.nas_msg_emm_type') or \
+                   self._get_field_value(nas_field, 'nas_eps.nas_msg_esm_type')
+        
+        cause_code = self._get_field_value(nas_field, 'nas_eps.emm.cause')
+        if cause_code:
+            cause_code = int(cause_code)
+            
+        # Check security header type for integrity protection
+        sec_header = self._get_field_value(nas_field, 'nas_eps.security_header_type')
+        integrity_protected = sec_header in ['2', '3', '4']  # Integrity protected types
+        
+        establishment_cause = self._get_field_value(nas_field, 'nas_eps.emm.eps_attach_type')
+        imsi = self._get_field_value(nas_field, 'nas_eps.emm.imsi')
+        tmsi = self._get_field_value(nas_field, 'nas_eps.emm.guti.m_tmsi')
+        
+        seq_num = self._get_field_value(nas_field, 'nas_eps.seq')
+        if seq_num:
+            seq_num = int(seq_num)
+        
+        return NASMessage(
+            timestamp=timestamp,
+            message_type=msg_type or 'unknown',
+            cause_code=cause_code,
+            integrity_protected=integrity_protected,
+            establishment_cause=establishment_cause,
+            imsi=imsi,
+            tmsi=tmsi,
+            sequence_number=seq_num
+        )
+    
+    def _extract_rrc_message(self, packet, timestamp) -> Optional[RRCMessage]:
+        """Extract RRC message details from packet"""
+        rrc_field = packet.find('.//field[@name="lte-rrc"]')
+        if not rrc_field:
+            return None
+            
+        msg_type = self._get_field_value(rrc_field, 'lte-rrc.message_type')
+        establishment_cause = self._get_field_value(rrc_field, 'lte-rrc.establishmentCause')
+        ue_identity = self._get_field_value(rrc_field, 'lte-rrc.ue_Identity')
+        rnti = self._get_field_value(rrc_field, 'lte-rrc.c_RNTI')
+        
+        return RRCMessage(
+            timestamp=timestamp,
+            message_type=msg_type or 'unknown',
+            establishment_cause=establishment_cause,
+            ue_identity=ue_identity,
+            rnti=rnti
+        )
+    
+    def _get_field_value(self, parent, field_name):
+        """Extract field value from XML"""
+        field = parent.find(f'.//field[@name="{field_name}"]')
+        return field.get('value') if field is not None else None
+    
+    def run_detection_rules(self):
+        """Execute detection rules based only on NAS/RRC data"""
+        self._rule_1_unexpected_identity_request()
+        self._rule_2_persistent_reject_without_integrity()
+        self._rule_3_establishment_cause_mismatch()
+        self._rule_4_abnormal_attach_sequence()
+        self._rule_5_rapid_reject_recovery_pattern()
+        self._rule_6_imsi_exposure_pattern()
+        
+        return self.alerts
+    
+    def _rule_1_unexpected_identity_request(self):
+        """Rule 1: Detect Identity Request without preceding authentication context"""
+        for i, nas_msg in enumerate(self.nas_messages):
+            if nas_msg.message_type == 'identity_request':
+                # Look for authentication context in previous 10 messages
+                has_auth_context = False
+                for j in range(max(0, i-10), i):
+                    prev_msg = self.nas_messages[j]
+                    if prev_msg.message_type in ['authentication_request', 'attach_request', 'service_request']:
+                        # Check if authentication was ongoing
+                        if prev_msg.tmsi or prev_msg.imsi:
+                            has_auth_context = True
+                            break
+                
+                if not has_auth_context:
+                    self.alerts.append(DetectionAlert(
+                        rule_id='RULE_1',
+                        severity='HIGH',
+                        description='Identity Request without authentication context - possible IMSI extraction',
+                        timestamp=nas_msg.timestamp,
+                        evidence={'unexpected_identity_request': True}
+                    ))
+    
+    def _rule_2_persistent_reject_without_integrity(self):
+        """Rule 2: Detect persistent reject codes without integrity protection"""
+        persistent_causes = [8, 15, 3]  # Known persistent DoS causes
+        
+        for nas_msg in self.nas_messages:
+            if (nas_msg.message_type in ['attach_reject', 'service_reject'] and
+                nas_msg.cause_code in persistent_causes and
+                not nas_msg.integrity_protected):
+                
+                self.alerts.append(DetectionAlert(
+                    rule_id='RULE_2',
+                    severity='HIGH',
+                    description=f'Persistent reject code {nas_msg.cause_code} without integrity protection',
+                    timestamp=nas_msg.timestamp,
+                    evidence={
+                        'cause_code': nas_msg.cause_code,
+                        'integrity_protected': nas_msg.integrity_protected
+                    }
+                ))
+    
+    def _rule_3_establishment_cause_mismatch(self):
+        """Rule 3: Detect establishment cause mismatch between RRC and NAS"""
+        # Create time-based correlation windows
+        for rrc_msg in self.rrc_messages:
+            if rrc_msg.message_type == 'rrc_connection_request' and rrc_msg.establishment_cause:
+                # Find NAS message within 5 second window
+                for nas_msg in self.nas_messages:
+                    if (abs(nas_msg.timestamp - rrc_msg.timestamp) <= 5.0 and
+                        nas_msg.message_type in ['attach_request', 'service_request'] and
+                        nas_msg.establishment_cause):
+                        
+                        # Map and compare establishment causes
+                        if self._establishment_causes_mismatch(rrc_msg.establishment_cause, 
+                                                             nas_msg.establishment_cause):
+                            self.alerts.append(DetectionAlert(
+                                rule_id='RULE_3',
+                                severity='MEDIUM',
+                                description='RRC-NAS establishment cause mismatch detected',
+                                timestamp=nas_msg.timestamp,
+                                evidence={
+                                    'rrc_cause': rrc_msg.establishment_cause,
+                                    'nas_cause': nas_msg.establishment_cause
+                                }
+                            ))
+    
+    def _rule_4_abnormal_attach_sequence(self):
+        """Rule 4: Detect abnormal attach/service request sequences"""
+        attach_sequences = []
+        
+        for i, nas_msg in enumerate(self.nas_messages):
+            if nas_msg.message_type == 'attach_request':
+                # Track the sequence following attach request
+                sequence = [nas_msg]
+                for j in range(i+1, min(i+10, len(self.nas_messages))):
+                    next_msg = self.nas_messages[j]
+                    if next_msg.timestamp - nas_msg.timestamp > 30.0:  # 30 second window
+                        break
+                    sequence.append(next_msg)
+                
+                # Check for abnormal patterns
+                if self._is_abnormal_sequence(sequence):
+                    self.alerts.append(DetectionAlert(
+                        rule_id='RULE_4',
+                        severity='MEDIUM',
+                        description='Abnormal attach/service sequence detected',
+                        timestamp=nas_msg.timestamp,
+                        evidence={'sequence_length': len(sequence)}
+                    ))
+    
+    def _rule_5_rapid_reject_recovery_pattern(self):
+        """Rule 5: Detect rapid reject followed by immediate retry pattern"""
+        for i, nas_msg in enumerate(self.nas_messages):
+            if nas_msg.message_type in ['attach_reject', 'service_reject']:
+                # Look for immediate retry within 10 seconds
+                for j in range(i+1, len(self.nas_messages)):
+                    next_msg = self.nas_messages[j]
+                    if next_msg.timestamp - nas_msg.timestamp > 10.0:
+                        break
+                    
+                    if next_msg.message_type in ['attach_request', 'service_request']:
+                        # Check if using different identity (potential overshadowing)
+                        if (nas_msg.tmsi != next_msg.tmsi or 
+                            (nas_msg.imsi and next_msg.imsi and nas_msg.imsi != next_msg.imsi)):
+                            
+                            self.alerts.append(DetectionAlert(
+                                rule_id='RULE_5',
+                                severity='HIGH',
+                                description='Rapid reject-retry with identity change detected',
+                                timestamp=next_msg.timestamp,
+                                evidence={
+                                    'time_diff': next_msg.timestamp - nas_msg.timestamp,
+                                    'identity_changed': True
+                                }
+                            ))
+                        break
+    
+    def _rule_6_imsi_exposure_pattern(self):
+        """Rule 6: Detect IMSI exposure following identity request"""
+        for i, nas_msg in enumerate(self.nas_messages):
+            if nas_msg.message_type == 'identity_request':
+                # Look for identity response with IMSI
+                for j in range(i+1, min(i+5, len(self.nas_messages))):
+                    response_msg = self.nas_messages[j]
+                    if (response_msg.message_type == 'identity_response' and
+                        response_msg.imsi and
+                        response_msg.timestamp - nas_msg.timestamp <= 10.0):
+                        
+                        # Check if this IMSI was not seen before in recent history
+                        imsi_seen_before = False
+                        for k in range(max(0, i-50), i):
+                            prev_msg = self.nas_messages[k]
+                            if prev_msg.imsi == response_msg.imsi:
+                                imsi_seen_before = True
+                                break
+                        
+                        if not imsi_seen_before:
+                            self.alerts.append(DetectionAlert(
+                                rule_id='RULE_6',
+                                severity='HIGH',
+                                description='IMSI exposure following identity request',
+                                timestamp=response_msg.timestamp,
+                                evidence={'imsi_exposed': True, 'new_imsi': True}
+                            ))
+                        break
+    
+    def _establishment_causes_mismatch(self, rrc_cause, nas_cause):
+        """Check if RRC and NAS establishment causes are mismatched"""
+        # Simplified mapping - in reality would need full 3GPP specification mapping
+        rrc_to_nas_mapping = {
+            'mo-Signalling': ['eps-attach', 'combined-attach'],
+            'mo-Data': ['normal-service'],
+            'mt-Access': ['emergency-attach']
+        }
+        
+        expected_nas_causes = rrc_to_nas_mapping.get(rrc_cause, [])
+        return nas_cause not in expected_nas_causes if expected_nas_causes else False
+    
+    def _is_abnormal_sequence(self, sequence):
+        """Check if message sequence is abnormal"""
+        if len(sequence) < 2:
+            return False
+            
+        # Check for multiple rejects in sequence
+        reject_count = sum(1 for msg in sequence 
+                          if msg.message_type in ['attach_reject', 'service_reject'])
+        
+        # Check for missing expected responses
+        has_request = any(msg.message_type in ['attach_request', 'service_request'] 
+                         for msg in sequence)
+        has_response = any(msg.message_type in ['attach_accept', 'attach_complete'] 
+                          for msg in sequence)
+        
+        return reject_count > 2 or (has_request and not has_response and reject_count == 0)
+    
+    def generate_report(self):
+        """Generate detection report"""
+        return {
+            'analysis_summary': {
+                'total_nas_messages': len(self.nas_messages),
+                'total_rrc_messages': len(self.rrc_messages),
+                'total_alerts': len(self.alerts),
+                'high_severity_alerts': len([a for a in self.alerts if a.severity == 'HIGH']),
+                'medium_severity_alerts': len([a for a in self.alerts if a.severity == 'MEDIUM'])
+            },
+            'alerts': [
+                {
+                    'rule_id': alert.rule_id,
+                    'severity': alert.severity,
+                    'description': alert.description,
+                    'timestamp': datetime.fromtimestamp(alert.timestamp).isoformat(),
+                    'evidence': alert.evidence
+                }
+                for alert in sorted(self.alerts, key=lambda x: x.timestamp)
+            ]
+        }
+
+def main():
+    """Main execution function"""
+    detector = AdaptOverDetector()
+    
+    try:
+        detector.parse_pdml('cellular_trace.pdml')
+        alerts = detector.run_detection_rules()
+        report = detector.generate_report()
+        
+        print(f"Analysis complete: {len(alerts)} alerts generated")
+        for alert in report['alerts']:
+            print(f"[{alert['severity']}] {alert['rule_id']}: {alert['description']}")
+                
+    except Exception as e:
+        print(f"Error: {e}")
+
+if __name__ == "__main__":
+    main()

@@ -50,7 +50,7 @@ class PCAPExtractor:
 
             # Protocols to remove (unwanted network layer protocols)
             unwanted_protocols = {
-                'geninfo', 'frame', 'eth', 'ip', 'udp', 'gsmtap',
+                'geninfo', 'eth', 'ip', 'udp', 'gsmtap',
                 'gsmtap_extra', 'fake-field-wrapper', 'ppp', 'ipcp'
             }
 
