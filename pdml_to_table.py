@@ -5,6 +5,8 @@ import xml.etree.ElementTree as ET
 import csv
 import re
 from pathlib import Path
+from nas_headers import nas_headers
+from rrc_headers import rrc_headers
 
 
 class PdmlToTableConverter:
@@ -15,10 +17,35 @@ class PdmlToTableConverter:
         self.rrc_packets = []
         self.nas_fields = set()
         self.rrc_fields = set()
+
+        # Initialize prioritized field lists
+        self.nas_priority_fields = nas_headers
+        self.rrc_priority_fields = rrc_headers
+
+        # Create field priority lookup dictionaries for fast checking
+        self.nas_field_priority = {field: idx for idx, field in enumerate(self.nas_priority_fields)}
+        self.rrc_field_priority = {field: idx for idx, field in enumerate(self.rrc_priority_fields)}
+
         # Set of field names to exclude from CSV headers
         self.excluded_fields = set(excluded_fields) if excluded_fields else set()
         # Add default exclusions
         self.excluded_fields.update(['MCC_MNC_Digit', 'lte-rrc.bCCH_DL_SCH_Message.message'])
+
+    def _get_field_priority(self, field_name, packet_type):
+        """Get priority level of a field based on protocol type (lower number = higher priority)"""
+        if packet_type == 'nas':
+            return self.nas_field_priority.get(field_name, 999)
+        elif packet_type == 'rrc':
+            return self.rrc_field_priority.get(field_name, 999)
+        return 999  # Default for unknown fields
+
+    def _is_priority_field(self, field_name, packet_type):
+        """Check if field is in the priority list for given protocol"""
+        if packet_type == 'nas':
+            return field_name in self.nas_field_priority
+        elif packet_type == 'rrc':
+            return field_name in self.rrc_field_priority
+        return False
 
     def _slugify(self, text):
         """Convert text to slug format with underscores"""
@@ -40,9 +67,24 @@ class PdmlToTableConverter:
         nas_count = 0
         rrc_count = 0
 
-        # Pre-compile patterns for better performance
-        nas_patterns = {'nas', 'emm', 'esm', 'lte_nas'}
-        rrc_patterns = {'rrc', 'bcch', 'dcch', 'ccch', 'pcch'}
+        # Pre-compile patterns for better performance - focus on LTE and 5G/NR protocols
+        nas_patterns = {'lte_nas', 'nas', 'emm', 'esm', 'nas-5gs', '5g_nas'}
+        rrc_patterns = {'lte_rrc', 'rrc', 'bcch', 'dcch', 'ccch', 'pcch', 'nr-rrc', 'nr_rrc'}
+
+        # Additional patterns to identify LTE and 5G/NR packets
+        network_patterns = {'lte', 'lte_nas', 'lte_rrc', 'nr', 'nr-rrc', 'nas-5gs', '5g'}
+
+        # First check if this is a network packet (LTE or 5G/NR)
+        is_network_packet = False
+        for field in fields:
+            field_name = field.get('name', '').lower().replace('-', '_')
+            if any(pattern in field_name for pattern in network_patterns):
+                is_network_packet = True
+                break
+
+        # If not a network packet, classify as 'other' to be ignored
+        if not is_network_packet:
+            return 'other'
 
         for field in fields:
             field_name = field.get('name', '').lower().replace('-', '_')
@@ -60,7 +102,7 @@ class PdmlToTableConverter:
 
         total_classified = nas_count + rrc_count
         if total_classified == 0:
-            return 'other'
+            return 'other'  # Only network packets (LTE/5G/NR) with NAS or RRC content are classified
 
         # Use majority rule
         if nas_count > rrc_count:
@@ -73,7 +115,7 @@ class PdmlToTableConverter:
                 field_name = field.get('name', '')
                 if any(msg in field_name for msg in ['rrcConnection', 'systemInformation', 'paging']):
                     return 'rrc'
-            return 'rrc'  # Default for LTE packets
+            return 'rrc'  # Default for network packets
 
     def _normalize_field_value(self, value, field_type=None):
         """
@@ -250,15 +292,14 @@ class PdmlToTableConverter:
                         if separate_by_protocol:
                             packet_type = self._classify_packet_type(packet)
 
+                            # Only include NAS and RRC packets, ignore other protocols
                             if packet_type == 'nas':
                                 self.nas_packets.append(packet_info)
                                 self._update_field_set(packet_info, self.nas_fields)
                             elif packet_type == 'rrc':
                                 self.rrc_packets.append(packet_info)
                                 self._update_field_set(packet_info, self.rrc_fields)
-                            else:
-                                self.packet_data.append(packet_info)
-                                self._update_field_set(packet_info, self.all_fields)
+                            # Ignore 'other' packets - they won't be included in any output
                         else:
                             self.packet_data.append(packet_info)
                             self._update_field_set(packet_info, self.all_fields)
@@ -277,19 +318,23 @@ class PdmlToTableConverter:
             if key != 'packet_number':
                 field_set.add(key)
 
-    def convert_pdml_to_csv(self, pdml_file, csv_file=None, separate_by_protocol=True, expanded=False):
+    def convert_pdml_to_csv(self, pdml_file, csv_file=None, separate_by_protocol=True, expanded=False, simple=False):
         """Convert PDML file to CSV(s) in one step"""
         if csv_file is None:
             csv_file = str(Path(pdml_file).with_suffix('.csv'))
 
         if self.parse_pdml(pdml_file, separate_by_protocol):
             if separate_by_protocol:
-                if expanded:
+                if simple:
+                    return self.generate_separate_simple_csvs(csv_file)
+                elif expanded:
                     return self.generate_separate_csvs_expanded(csv_file)
                 else:
                     return self.generate_separate_csvs(csv_file)
             else:
-                if expanded:
+                if simple:
+                    return self.generate_simple_csv(csv_file, self.packet_data, self.all_fields)
+                elif expanded:
                     return self.generate_csv_expanded(csv_file, self.packet_data, self.all_fields)
                 else:
                     return self.generate_csv(csv_file, self.packet_data, self.all_fields)
@@ -297,8 +342,11 @@ class PdmlToTableConverter:
         return False
 
     def _extract_packet_fields(self, packet, packet_idx):
-        """Extract all fields from a single packet with hierarchical naming"""
+        """Extract all fields from a single packet with hierarchical naming and field prioritization"""
         packet_info = {'packet_number': packet_idx + 1}
+
+        # Determine packet type for field prioritization
+        packet_type = self._classify_packet_type(packet)
 
         # Find the nested packet that contains the actual data
         nested_packets = packet.findall('packet')
@@ -308,18 +356,40 @@ class PdmlToTableConverter:
         else:
             fields = packet.findall('.//field')
 
+        # Separate priority fields from regular fields
+        priority_fields = []
+        regular_fields = []
+
         for field in fields:
-            self._extract_field_recursively(field, '', packet_info)
+            field_name = field.get('name', '')
+            if self._is_priority_field(field_name, packet_type):
+                priority_fields.append(field)
+            else:
+                regular_fields.append(field)
+
+        # Process priority fields first (in priority order)
+        if packet_type in ['nas', 'rrc']:
+            priority_list = self.nas_priority_fields if packet_type == 'nas' else self.rrc_priority_fields
+
+            # Sort priority fields by their priority order
+            priority_fields.sort(key=lambda f: self._get_field_priority(f.get('name', ''), packet_type))
+
+            for field in priority_fields:
+                self._extract_field_recursively(field, '', packet_info, packet_type)
+
+        # Process remaining regular fields
+        for field in regular_fields:
+            self._extract_field_recursively(field, '', packet_info, packet_type)
 
         return packet_info
 
-    def _extract_field_recursively(self, field_element, parent_path, packet_info):
-        """Recursively extract field data with filtering"""
+    def _extract_field_recursively(self, field_element, parent_path, packet_info, packet_type=None):
+        """Recursively extract field data with filtering and prioritization"""
         field_name = field_element.get('name', '')
 
         # Early skip checks
-        if (not field_name or 
-            self._should_skip_field(field_name) or 
+        if (not field_name or
+            self._should_skip_field(field_name) or
             field_element.get('hide') == 'yes'):
             return
 
@@ -338,14 +408,14 @@ class PdmlToTableConverter:
         # Create header (just the field name without suffixes)
         header = self._slugify(full_field_name)
         self.all_fields.add(header)
-        
+
         # Store the combined array as the field value
         packet_info[header] = field_data_array
 
-        # Recursively process sub-fields
+        # Recursively process sub-fields with packet type context
         sub_fields = field_element.findall('field')
         for sub_field in sub_fields:
-            self._extract_field_recursively(sub_field, full_field_name, packet_info)
+            self._extract_field_recursively(sub_field, full_field_name, packet_info, packet_type)
 
     def generate_separate_csvs(self, base_filename):
         """Generate separate CSV files for NAS and RRC packets"""
@@ -356,7 +426,7 @@ class PdmlToTableConverter:
         csv_configs = [
             (self.nas_packets, self.nas_fields, '_nas'),
             (self.rrc_packets, self.rrc_fields, '_rrc'),
-            (self.packet_data, self.all_fields, '')
+            # (self.packet_data, self.all_fields, '')
         ]
 
         for packets, fields, suffix in csv_configs:
@@ -376,7 +446,7 @@ class PdmlToTableConverter:
         csv_configs = [
             (self.nas_packets, self.nas_fields, '_nas_expanded'),
             (self.rrc_packets, self.rrc_fields, '_rrc_expanded'),
-            (self.packet_data, self.all_fields, '_expanded')
+            # (self.packet_data, self.all_fields, '_expanded')
         ]
 
         for packets, fields, suffix in csv_configs:
@@ -387,10 +457,181 @@ class PdmlToTableConverter:
 
         return success
 
+    def generate_simple_csv(self, output_file, packet_collection=None, field_collection=None):
+        """Generate CSV file with simple field names and values (no attributes)"""
+        try:
+            if packet_collection is None:
+                packet_collection = self.packet_data
+            if field_collection is None:
+                field_collection = self.all_fields
 
+            if not packet_collection:
+                print("No packet data to write to CSV")
+                return False
 
+            # Create ordered list of fields, excluding packet_number
+            field_list = sorted([f for f in field_collection if f != 'packet_number'])
 
+            # Add packet_number at the beginning
+            headers = ['packet_number'] + field_list
 
+            with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(headers)
+
+                for packet in packet_collection:
+                    row = [packet.get('packet_number', '')]
+
+                    for field in field_list:
+                        if field in packet:
+                            field_array = packet[field]
+
+                            # Extract just the value from the field array (index 5 is the 'value' attribute)
+                            if isinstance(field_array, list) and len(field_array) >= 6:
+                                # Use the 'value' attribute (index 5) or 'show' attribute (index 4) if value is empty
+                                field_value = field_array[5] if field_array[5] else field_array[4]
+                                row.append(field_value)
+                            else:
+                                row.append(str(field_array))
+                        else:
+                            row.append('')
+
+                    writer.writerow(row)
+
+            print(f"Successfully wrote {len(packet_collection)} packets to simple CSV {output_file}")
+            return True
+
+        except Exception as e:
+            print(f"Error writing simple CSV file: {e}")
+            return False
+
+    def generate_separate_simple_csvs(self, base_filename):
+        """Generate separate simple CSV files for NAS and RRC packets"""
+        success = True
+        base_path = Path(base_filename)
+
+        # Generate simple CSVs for each packet type
+        csv_configs = [
+            (self.nas_packets, self.nas_fields, '_nas_simple'),
+            (self.rrc_packets, self.rrc_fields, '_rrc_simple')
+        ]
+
+        for packets, fields, suffix in csv_configs:
+            if packets:
+                filename = str(base_path.parent / (base_path.stem + suffix + base_path.suffix))
+                if not self.generate_simple_csv(filename, packets, fields):
+                    success = False
+
+        return success
+
+    def generate_prioritized_csv(self, output_file, packet_collection=None, field_collection=None, protocol_type='all'):
+        """Generate CSV with prioritized field ordering based on protocol type - with individual columns"""
+        try:
+            if packet_collection is None:
+                packet_collection = self.packet_data
+            if field_collection is None:
+                field_collection = self.all_fields
+
+            if not packet_collection:
+                print("No packet data to write to CSV")
+                return False
+
+            # Get priority fields based on protocol type
+            priority_fields = []
+            if protocol_type == 'nas':
+                priority_fields = self.nas_priority_fields
+            elif protocol_type == 'rrc':
+                priority_fields = self.rrc_priority_fields
+
+            # Separate priority fields from other fields
+            priority_field_set = set(priority_fields)
+            priority_present = [f for f in priority_fields if f in field_collection]
+            other_fields = [f for f in field_collection if f not in priority_field_set and f != 'packet_number']
+
+            # Create ordered list of fields: packet_number, priority fields, other fields
+            field_list = ['packet_number'] + priority_present + sorted(other_fields)
+
+            # Generate CSV with individual columns using expanded format logic
+            return self._generate_csv_with_columns(output_file, packet_collection, field_list)
+
+        except Exception as e:
+            print(f"Error generating prioritized CSV: {e}")
+            return False
+
+    def _generate_csv_with_columns(self, output_file, packet_collection, field_list):
+        """Generate CSV with individual columns for each field"""
+        try:
+            # First pass: determine max attributes for each field
+            field_max_attrs = {}
+            for field in field_list:
+                max_attrs = 0
+                for packet in packet_collection:
+                    if field in packet:
+                        field_array = packet.get(field, [])
+                        if isinstance(field_array, list):
+                            max_attrs = max(max_attrs, len(field_array))
+                # Default to at least 1 attribute if field never appears
+                field_max_attrs[field] = max_attrs if max_attrs > 0 else 1
+
+            # Create headers for individual columns
+            headers = []
+            for field in field_list:
+                max_attrs = field_max_attrs[field]
+                if max_attrs == 1:
+                    headers.append(field)
+                else:
+                    for i in range(max_attrs):
+                        headers.append(f"{field}_{i}")
+
+            with open(output_file, 'w', newline='', encoding='utf-8') as csvfile:
+                writer = csv.writer(csvfile)
+                writer.writerow(headers)
+
+                for packet in packet_collection:
+                    row = []
+                    for field in field_list:
+                        field_array = packet.get(field, None)
+                        expected_attrs = field_max_attrs[field]
+
+                        if field_array is None:
+                            # Field not present in this packet - use -1 for expected number of attributes
+                            row.extend(['-1'] * expected_attrs)
+                        elif isinstance(field_array, list) and field_array:
+                            # Field exists with data - pad if needed
+                            padded_array = field_array[:]
+                            while len(padded_array) < expected_attrs:
+                                padded_array.append('-1')
+                            row.extend(str(item) for item in padded_array)
+                        else:
+                            # Field exists but is empty - use -1 for expected number of attributes
+                            row.extend(['-1'] * expected_attrs)
+
+                    writer.writerow(row)
+
+            print(f"Successfully wrote {len(packet_collection)} packets to {output_file}")
+            return True
+
+        except Exception as e:
+            print(f"Error generating CSV with columns: {e}")
+            return False
+
+    def generate_separate_prioritized_csvs(self, base_filename):
+        """Generate separate prioritized CSV files for NAS and RRC packets"""
+        success = True
+        base_path = Path(base_filename)
+
+        # Generate prioritized CSVs for each packet type
+        if self.nas_packets:
+            nas_csv_file = str(base_path.parent / (base_path.stem + '_nas_prioritized.csv'))
+            if not self.generate_prioritized_csv(nas_csv_file, self.nas_packets, self.nas_fields, 'nas'):
+                success = False
+
+        if self.rrc_packets:
+            rrc_csv_file = str(base_path.parent / (base_path.stem + '_rrc_prioritized.csv'))
+            if not self.generate_prioritized_csv(rrc_csv_file, self.rrc_packets, self.rrc_fields, 'rrc'):
+                success = False
+
+        return success
 
     def generate_csv(self, output_file, packet_collection=None, field_collection=None):
         """Generate CSV file with normalized data in structured format"""
@@ -411,10 +652,10 @@ class PdmlToTableConverter:
             elif packet_collection is self.nas_packets:
                 protocol_type = "NAS"
                 label = 1
-            else:
-                # Default to RRC if can't determine
-                protocol_type = "RRC"
-                label = 0
+            # else:
+            #     # Default to RRC if can't determine
+            #     protocol_type = "RRC"
+            #     label = 0
 
             # First pass: determine max attributes for each field
             field_max_attrs = {}
@@ -587,13 +828,6 @@ if __name__ == "__main__":
         if converter.convert_pdml_to_csv(xml_file, expanded=True):
             expanded_csv_file = xml_file.replace('.xml', '_expanded.csv')
             print(f"   ✅ Expanded CSV: {expanded_csv_file}")
-
-        print("\nNote: The regular CSV format includes protocol identification and labels:")
-        print("      data, label")
-        print("      RRC data - field1 : [val1, val2]; field2 : [val3]; ..., 0")
-        print("      NAS data - field1 : [val1, val2]; field2 : [val3]; ..., 1")
-        print("\n      The expanded CSV format creates separate columns for each field attribute plus label:")
-        print("      - field_name_name, field_name_showname, field_name_size, ..., label")
 
     else:
         print("No XML files found in current directory. Please provide an XML file to convert.")
