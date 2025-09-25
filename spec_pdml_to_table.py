@@ -5,7 +5,6 @@ import xml.etree.ElementTree as ET
 import csv
 import re
 from pathlib import Path
-# Essential fields for specification-based detection
 from spec_nas_header import nas_headers
 from spec_rrc_header import rrc_headers
 
@@ -57,7 +56,7 @@ class PdmlToTableConverter:
             return 'other'
 
     def _normalize_field_value(self, value, field_type=None):
-        """Normalize field values"""
+        """Simplified normalization for show, value, and showname"""
         if value is None or value == '':
             return '-1'
         
@@ -65,44 +64,35 @@ class PdmlToTableConverter:
         if value_str.lower() in {'n/a', 'null', 'none'}:
             return '-1'
         
-        if field_type == 'name':
-            return '1' if value_str else '0'
-        elif field_type == 'showname':
-            if not value_str:
-                return '100'
-            hash_val = sum(ord(c) for c in value_str) % 900
-            return str(hash_val + 100)
-        elif field_type in ['size', 'pos']:
-            return value_str if value_str else '0'
-        elif field_type == 'show':
-            if value_str == 'True':
-                return '1'
-            elif value_str == 'False':
-                return '0'
-            if value_str.replace('-', '').replace('.', '').isdigit():
-                try:
-                    num = abs(int(float(value_str)))
-                    return str(min(num, 9))
-                except:
-                    pass
-            hash_val = sum(ord(c) for c in value_str) % 10
-            return str(hash_val)
-        elif field_type in ['value', 'unmasked']:
-            if len(value_str) > 8:
-                if all(c in '0123456789abcdefABCDEF' for c in value_str):
-                    try:
-                        first = int(value_str[:2], 16) if len(value_str) >= 2 else 0
-                        last = int(value_str[-2:], 16) if len(value_str) >= 2 else 0
-                        result = (first ^ last) % 100
-                        return f'{result:02d}'
-                    except:
-                        return '99'
-            if len(value_str) <= 4:
-                if value_str.isdigit():
-                    return value_str.zfill(2)
-                return value_str
-            hash_val = sum(ord(c) * (i + 1) for i, c in enumerate(value_str[:10])) % 100
-            return f'{hash_val:02d}'
+        # Special handling for showname with common patterns
+        if field_type == 'showname':
+            # Handle c1: patterns
+            if 'c1:' in value_str.lower():
+                parts = value_str.split('c1:')
+                if len(parts) > 1:
+                    word = parts[1].strip().split()[0]  # Get first word after c1:
+                    # Remove parentheses, numbers, colons, commas first
+                    cleaned = re.sub(r'[()0-9:,]', '', word).strip()
+                    # Remove -r followed by any characters
+                    cleaned = re.sub(r'-r.*', '', cleaned)
+                    return cleaned
+            
+            # Handle establishmentCause: patterns
+            if 'establishmentcause:' in value_str.lower():
+                parts = value_str.split(':')
+                if len(parts) > 1:
+                    word = parts[1].strip().split()[0]  # Get first word after colon
+                    # Remove parentheses and numbers
+                    cleaned = re.sub(r'[()0-9]', '', word).strip()
+                    return cleaned
+                
+            if 'ue-Identity:' in value_str.lower():
+                parts = value_str.split(':')
+                if len(parts) > 1:
+                    word = parts[1].strip().split()[0]  # Get first word after colon
+                    # Remove parentheses and numbers
+                    cleaned = re.sub(r'[()0-9]', '', word).strip()
+                    return cleaned
         
         return value_str
 
@@ -111,7 +101,7 @@ class PdmlToTableConverter:
         if not field_name:
             return True
         
-        skip_prefixes = ('geninfo.', 'frame.', 'user_dlt.', 'aww.')
+        skip_prefixes = ('geninfo.', 'user_dlt.', 'aww.')
         if field_name.startswith(skip_prefixes):
             return True
         
@@ -122,55 +112,11 @@ class PdmlToTableConverter:
         return any(excluded in field_name for excluded in self.excluded_fields)
 
     def _process_field_values(self, field_element):
-        """Process field values with normalization"""
-        normalized_attributes = []
-        
-        field_name = field_element.get('name', '')
-        normalized_attributes.append(self._normalize_field_value(field_name, 'name'))
-        
-        optional_attrs = [
-            ('showname', 'showname'),
-            ('size', 'size'),
-            ('pos', 'pos'),
-            ('show', 'show'),
-            ('value', 'value'),
-            ('unmaskedvalue', 'unmasked')
-        ]
-        
-        for attr_name, field_type in optional_attrs:
-            if attr_name in field_element.attrib:
-                value = field_element.get(attr_name)
-                normalized_value = self._normalize_field_value(value, field_type)
-                normalized_attributes.append(normalized_value)
-        
-        return normalized_attributes
-
-    def _extract_field_recursively(self, field_element, parent_path, packet_info, target_fields):
-        """Recursively extract field data - only exact target field matches"""
-        field_name = field_element.get('name', '')
-        
-        if (not field_name or 
-            self._should_skip_field(field_name) or
-            field_element.get('hide') == 'yes'):
-            return
-        
-        full_field_name = f"{parent_path}.{field_name}" if parent_path else field_name
-        header = self._slugify(full_field_name)
-        
-        # Only process if this is an EXACT target field match
-        if header in target_fields:
-            field_show = field_element.get('show', '')
-            field_value = field_element.get('value', '')
-            
-            if field_show or field_value:
-                field_data_array = self._process_field_values(field_element)
-                self.all_fields.add(header)
-                packet_info[header] = field_data_array
-                return  # Don't recurse into sub-fields if we found exact match
-        
-        # Only recurse if we haven't found an exact match
-        for sub_field in field_element.findall('field'):
-            self._extract_field_recursively(sub_field, full_field_name, packet_info, target_fields)
+        """Process show, value, and showname attributes"""
+        show_value = self._normalize_field_value(field_element.get('show', ''), 'show')
+        value_value = self._normalize_field_value(field_element.get('value', ''), 'value')
+        showname_value = self._normalize_field_value(field_element.get('showname', ''), 'showname')
+        return [show_value, value_value, showname_value]
 
     def _extract_packet_fields(self, packet, packet_idx):
         """Extract only exact target field matches from a packet"""
@@ -195,7 +141,7 @@ class PdmlToTableConverter:
         return packet_info
     
     def _process_fields_for_targets(self, fields, parent_path, packet_info, target_fields):
-        """Process fields to find exact target matches without recursion conflicts"""
+        """Process fields to find exact target matches"""
         for field in fields:
             field_name = field.get('name', '')
             
@@ -274,7 +220,7 @@ class PdmlToTableConverter:
             return False
 
     def generate_csv(self, output_file, packet_collection, field_collection, label):
-        """Generate CSV file with only target fields"""
+        """Generate CSV file with show, value, and showname for target fields"""
         try:
             if not packet_collection:
                 print("No packet data to write to CSV")
@@ -292,28 +238,12 @@ class PdmlToTableConverter:
                 print(f"No target fields found in {len(packet_collection)} packets")
                 return False
             
-            # Determine max attributes for each field
-            field_max_attrs = {}
-            for field in actual_fields:
-                max_attrs = 0
-                for packet in packet_collection:
-                    if field in packet:
-                        field_array = packet.get(field, [])
-                        if isinstance(field_array, list):
-                            max_attrs = max(max_attrs, len(field_array))
-                field_max_attrs[field] = max_attrs if max_attrs > 0 else 1
-            
-            # Create headers
-            attr_names = ['_name', '_showname', '_size', '_pos', '_show', '_value', '_unmasked']
+            # Create headers - show, value, and showname for each field
             headers = []
-            
             for field in actual_fields:
-                max_attrs = field_max_attrs[field]
-                for i in range(max_attrs):
-                    if i < len(attr_names):
-                        headers.append(f"{field}{attr_names[i]}")
-                    else:
-                        headers.append(f"{field}_attr_{i}")
+                headers.append(f"{field}_show")
+                headers.append(f"{field}_value")
+                headers.append(f"{field}_showname")
             
             headers.append('label')
             
@@ -326,21 +256,22 @@ class PdmlToTableConverter:
                     
                     for field in actual_fields:
                         field_array = packet.get(field, None)
-                        max_attrs = field_max_attrs[field]
                         
-                        if field_array is None:
-                            row.extend(['-1'] * max_attrs)
-                        elif isinstance(field_array, list) and field_array:
-                            for i in range(max_attrs):
-                                if i < len(field_array):
-                                    row.append(field_array[i])
-                                else:
-                                    row.append('-1')
+                        if field_array is None or not isinstance(field_array, list):
+                            row.extend(['-1', '-1', '-1'])  # show, value, showname
                         else:
-                            row.extend(['-1'] * max_attrs)
+                            # Expecting [show_value, value_value, showname_value]
+                            show_val = field_array[0] if len(field_array) > 0 else '-1'
+                            value_val = field_array[1] if len(field_array) > 1 else '-1'
+                            showname_val = field_array[2] if len(field_array) > 2 else '-1'
+                            row.extend([show_val, value_val, showname_val])
                     
                     row.append(label)
                     writer.writerow(row)
+                    print(row)
+                    
+                    # Add the specification-based detection from here
+                    
             
             print(f"Successfully wrote {len(packet_collection)} packets with {len(actual_fields)} target fields to {output_file}")
             return True
